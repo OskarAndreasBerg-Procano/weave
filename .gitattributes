@@ -1,0 +1,7 @@
+# Keep LF endings everywhere. Critical for `weave`: a CRLF shebang line
+# (`#!/usr/bin/env python3\r`) breaks execution on macOS/Linux.
+* text=auto eol=lf
+weave text eol=lf
+*.png binary
+*.jpg binary
+*.gif binary

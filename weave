@@ -1,0 +1,4470 @@
+#!/usr/bin/env python3
+"""weave - a cooperation space and unified graph for project coding with Claude.
+
+A single-file tool. Stdlib only. No network required.
+Run `weave init` inside a project, then `weave serve` for the live workspace.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+import io
+import hashlib
+import contextlib
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# force utf-8 on the std streams so middle-dot separators and other
+# non-ascii output don't mojibake on Windows consoles (cp1252 default).
+for _s in (sys.stdout, sys.stderr, sys.stdin):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+# --------------------------------------------------------------------------
+# constants
+# --------------------------------------------------------------------------
+WEAVE_DIRNAME = ".weave"
+SELF_PATH = os.path.abspath(__file__)
+
+NODE_TYPES = ["plan", "task", "decision", "file", "folder", "note",
+              "question", "milestone"]
+EDGE_RELS = ["implements", "depends_on", "blocks", "relates_to",
+             "supersedes", "produces", "contains", "answers", "reads"]
+TASK_STATES = ["todo", "doing", "done", "blocked"]
+Q_STATES = ["open", "resolved"]
+TIERS = ["active", "pinned", "archive"]  # memory tier; default = active
+
+SCAN_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".rb",
+             ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".swift", ".kt", ".m",
+             ".php", ".scala", ".clj", ".ex", ".exs", ".sh", ".sql", ".html",
+             ".css", ".scss", ".vue", ".svelte", ".md", ".json", ".yaml",
+             ".yml", ".toml", ".lua", ".dart", ".r"}
+SKIP_DIRS = {".git", "node_modules", WEAVE_DIRNAME, "dist", "build", "out",
+             "target", "__pycache__", ".venv", "venv", "env", ".next",
+             ".idea", ".vscode", "coverage", ".pytest_cache", ".mypy_cache",
+             "vendor", ".cache", "tmp"}
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def short_ts(iso: str) -> str:
+    try:
+        d = datetime.fromisoformat(iso)
+        return d.strftime("%m-%d %H:%M")
+    except Exception:
+        return iso[:16]
+
+
+def new_id() -> str:
+    return "n_" + uuid.uuid4().hex[:6]
+
+
+def find_root(start: str = None):
+    """Walk up from cwd to find the project root containing .weave/.
+
+    Refuses to treat $HOME itself as a weave project: a `.weave/` directory
+    sitting at the home root is almost always an accident (stale global-index
+    collision from older versions, etc.) - real projects live under, not at,
+    the user's home.
+    """
+    d = os.path.abspath(start or os.getcwd())
+    home = os.path.abspath(os.path.expanduser("~"))
+    while True:
+        if os.path.isdir(os.path.join(d, WEAVE_DIRNAME)) and d != home:
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def die(msg: str, code: int = 1):
+    sys.stderr.write("weave: " + msg + "\n")
+    sys.exit(code)
+
+
+def paths(root: str):
+    w = os.path.join(root, WEAVE_DIRNAME)
+    return {
+        "weave": w,
+        "graph": os.path.join(w, "graph.json"),
+        "html": os.path.join(w, "graph.html"),
+        "inbox": os.path.join(w, "inbox"),
+        "outbox": os.path.join(w, "outbox"),
+        "plans": os.path.join(w, "plans"),
+        "focus": os.path.join(w, "focus"),
+        "archive": os.path.join(w, "inbox", "_archive"),
+        "versions": os.path.join(w, "versions"),
+    }
+
+
+VERSION_CAP = 50  # rotating snapshots kept in .weave/versions/
+
+
+# --------------------------------------------------------------------------
+# graph io
+# --------------------------------------------------------------------------
+def empty_graph(name: str) -> dict:
+    return {
+        "meta": {"project": name, "rev": 0, "created": now(), "schema": 1},
+        "nodes": {},
+        "edges": [],
+        "log": [],
+    }
+
+
+def load_graph(root: str) -> dict:
+    p = paths(root)["graph"]
+    if not os.path.exists(p):
+        return empty_graph(os.path.basename(root))
+    with open(p, "r", encoding="utf-8") as f:
+        g = json.load(f)
+    g.setdefault("meta", {}).setdefault("rev", 0)
+    g.setdefault("nodes", {})
+    g.setdefault("edges", [])
+    g.setdefault("log", [])
+    return g
+
+
+def save_graph(root: str, g: dict):
+    p = paths(root)
+    g["meta"]["rev"] = g["meta"].get("rev", 0) + 1
+    g["meta"]["updated"] = now()
+    gp = p["graph"]
+    tmp = gp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(g, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, gp)
+    _snapshot_version(p["versions"], g)
+
+
+def _snapshot_version(vdir: str, g: dict):
+    """Write a snapshot of the just-saved graph and rotate to VERSION_CAP."""
+    try:
+        os.makedirs(vdir, exist_ok=True)
+        rev = g["meta"].get("rev", 0)
+        snap = os.path.join(vdir, "%07d.json" % rev)
+        with open(snap, "w", encoding="utf-8") as f:
+            json.dump(g, f, indent=2, ensure_ascii=False)
+        files = sorted(f for f in os.listdir(vdir) if f.endswith(".json"))
+        for old in files[:-VERSION_CAP]:
+            try:
+                os.remove(os.path.join(vdir, old))
+            except OSError:
+                pass
+    except Exception:
+        pass  # snapshotting must never break a save
+
+
+def log_event(g: dict, actor: str, action: str, node: str = None):
+    g["log"].append({"ts": now(), "actor": actor, "action": action,
+                      "node": node})
+    g["log"] = g["log"][-300:]
+
+
+def resolve(g: dict, ref: str) -> str:
+    """Resolve a node reference: exact id, id suffix, or title substring."""
+    if not ref:
+        die("empty node reference")
+    if ref in g["nodes"]:
+        return ref
+    low = ref.lower()
+    hits = []
+    for nid, n in g["nodes"].items():
+        if nid.endswith(ref) or low in n.get("title", "").lower():
+            hits.append(nid)
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die("no node matches '%s'" % ref)
+    die("ambiguous '%s' -> %s" % (ref, ", ".join(
+        "%s (%s)" % (h, g["nodes"][h].get("title", "")) for h in hits)))
+
+
+def degree(g: dict, nid: str) -> int:
+    return sum(1 for e in g["edges"] if e["from"] == nid or e["to"] == nid)
+
+
+def get_focus(root: str):
+    fp = paths(root)["focus"]
+    if os.path.exists(fp):
+        v = open(fp).read().strip()
+        return v or None
+    return None
+
+
+def set_focus(root: str, nid):
+    fp = paths(root)["focus"]
+    if nid:
+        open(fp, "w").write(nid)
+    elif os.path.exists(fp):
+        os.remove(fp)
+
+
+def upsert_file_node(g: dict, root: str, relpath: str, actor: str) -> str:
+    """Create or refresh a file node by path. Returns node id."""
+    relpath = relpath.replace("\\", "/")
+    for nid, n in g["nodes"].items():
+        if n.get("type") == "file" and n.get("path") == relpath:
+            ap = os.path.join(root, relpath)
+            if os.path.exists(ap):
+                n["hash"] = _file_hash(ap)
+                n.pop("missing", None)
+            n["updated"] = now()
+            return nid
+    nid = new_id()
+    ap = os.path.join(root, relpath)
+    g["nodes"][nid] = {
+        "id": nid, "type": "file", "title": os.path.basename(relpath),
+        "path": relpath, "body": "", "tags": [], "status": "",
+        "author": actor, "created": now(), "updated": now(),
+        "hash": _file_hash(ap) if os.path.exists(ap) else "",
+    }
+    return nid
+
+
+def _file_hash(path: str) -> str:
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()[:12]
+    except Exception:
+        return ""
+
+
+def add_edge(g: dict, src: str, dst: str, rel: str):
+    for e in g["edges"]:
+        if e["from"] == src and e["to"] == dst and e["rel"] == rel:
+            return False
+    g["edges"].append({"from": src, "to": dst, "rel": rel, "created": now()})
+    return True
+
+
+def _children(g: dict, nid: str, rel: str = "contains"):
+    """Nodes reachable from nid via `rel` edges (one hop)."""
+    return [e["to"] for e in g["edges"]
+            if e["from"] == nid and e["rel"] == rel]
+
+
+def expand_paths(g: dict, nid: str, seen=None):
+    """Resolve a node to concrete file paths.
+
+    file node  -> its path.
+    folder node-> recurse through `contains` edges.
+    other node -> recurse through its `reads` edges (so a plan's reading list
+                  can itself reference sub-plans / tasks)."""
+    if seen is None:
+        seen = set()
+    if nid in seen or nid not in g["nodes"]:
+        return []
+    seen.add(nid)
+    n = g["nodes"][nid]
+    t = n.get("type")
+    if t == "file":
+        return [n["path"]] if n.get("path") else []
+    if t == "folder":
+        out = []
+        for c in _children(g, nid, "contains"):
+            out += expand_paths(g, c, seen)
+        return out
+    # plan / task / milestone: follow its own reads edges
+    out = []
+    for c in _children(g, nid, "reads"):
+        out += expand_paths(g, c, seen)
+    return out
+
+
+def reading_list(g: dict, nid: str):
+    """Ordered, de-duplicated reading list for a task/plan node.
+
+    Walks up implements-edges to inherit a parent plan's reading list, then
+    adds the node's own `reads` targets. Returns list of (path, source_title)."""
+    out, seen = [], set()
+
+    def add_from(src_id):
+        for tgt in _children(g, src_id, "reads"):
+            label = g["nodes"].get(tgt, {}).get("title", tgt)
+            for p in expand_paths(g, tgt):
+                if p not in seen:
+                    seen.add(p)
+                    out.append((p, label))
+
+    # inherited: parent plans reached via implements edges
+    parents = [e["to"] for e in g["edges"]
+               if e["from"] == nid and e["rel"] == "implements"]
+    for p in parents:
+        add_from(p)
+    add_from(nid)
+    return out
+
+
+def _global_index_path():
+    # MUST NOT be inside a `.weave/` directory: find_root() walks up looking
+    # for `.weave/` and would otherwise treat $HOME as a weave project. So
+    # use a plain dotfile in $HOME.
+    return os.path.join(os.path.expanduser("~"), ".weave_index.json")
+
+
+def _load_global_index():
+    p = _global_index_path()
+    # Best-effort migration from the old (broken) location.
+    if not os.path.exists(p):
+        legacy = os.path.join(os.path.expanduser("~"), ".weave", "index.json")
+        if os.path.exists(legacy):
+            try:
+                shutil.copyfile(legacy, p)
+            except Exception:
+                pass
+    if not os.path.exists(p):
+        return {"projects": []}
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return {"projects": []}
+
+
+def _save_global_index(idx):
+    p = _global_index_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(idx, f, indent=2)
+    except Exception:
+        pass  # global registry is convenience; never block local work
+
+
+def _port_alive(port, host="127.0.0.1", timeout=0.05):
+    """Quick liveness probe for a local TCP port."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex((host, port)) == 0
+        finally:
+            s.close()
+    except Exception:
+        return False
+
+
+def _register_project(root, name):
+    """Add or refresh this project's entry in the cross-machine index."""
+    idx = _load_global_index()
+    root = os.path.abspath(root)
+    existing = next((p for p in idx["projects"]
+                     if os.path.abspath(p.get("path", "")) == root), None)
+    if existing:
+        existing["last_seen"] = now()
+        existing["name"] = name
+    else:
+        idx["projects"].append({"path": root, "name": name,
+                                 "first_seen": now(), "last_seen": now()})
+    _save_global_index(idx)
+
+
+def upsert_folder_node(g: dict, relpath: str) -> str:
+    """Create or fetch a folder node by path. Returns node id."""
+    relpath = relpath.replace("\\", "/").rstrip("/") or "."
+    for nid, n in g["nodes"].items():
+        if n.get("type") == "folder" and n.get("path") == relpath:
+            return nid
+    nid = new_id()
+    title = "/" if relpath == "." else os.path.basename(relpath) + "/"
+    g["nodes"][nid] = {
+        "id": nid, "type": "folder", "title": title, "path": relpath,
+        "body": "", "status": "", "tags": [], "author": "scan",
+        "created": now(), "updated": now()}
+    return nid
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+def cmd_init(args):
+    root = find_root() or os.getcwd()
+    p = paths(root)
+    name = args.name or os.path.basename(root)
+    fresh = not os.path.isdir(p["weave"])
+
+    for d in [p["weave"], p["inbox"], p["outbox"], p["plans"], p["archive"]]:
+        os.makedirs(d, exist_ok=True)
+    if not os.path.exists(p["graph"]):
+        save_graph(root, empty_graph(name))
+
+    _write_claude_md(root, name)
+    _write_commands(root)
+    _write_settings(root)
+    _write_mcp_json(root)
+    _write_gitignore(root)
+    _register_project(root, name)
+
+    readme = os.path.join(p["inbox"], "README.md")
+    if not os.path.exists(readme):
+        open(readme, "w").write(
+            "# inbox\n\nDrop markdown files here for Claude. They surface in "
+            "`weave inbox` and at session start.\nArchive processed ones with "
+            "`weave inbox <file> --done`.\n")
+
+    print("weave: %s '%s' at %s" % (
+        "initialized" if fresh else "updated", name, p["weave"]))
+    print("  graph    %s" % p["graph"])
+    print("  hooks    .claude/settings.local.json")
+    print("  commands .claude/commands/weave-*.md")
+    print("  mcp      .mcp.json  (native weave_* tools for Claude)")
+    print("\nnext:  weave demo   then   weave serve")
+
+
+def cmd_add(args):
+    root = find_root() or die("not a weave project (run `weave init`)")
+    g = load_graph(root)
+    if args.type not in NODE_TYPES:
+        die("type must be one of: " + ", ".join(NODE_TYPES))
+    nid = new_id()
+    status = args.status or ("todo" if args.type == "task"
+                             else "open" if args.type == "question" else "")
+    g["nodes"][nid] = {
+        "id": nid, "type": args.type, "title": args.title,
+        "body": args.body or "", "status": status,
+        "tags": [t.strip() for t in (args.tags or "").split(",") if t.strip()],
+        "path": args.path or "", "author": args.author,
+        "tier": args.tier or "active",
+        "created": now(), "updated": now(),
+    }
+    log_event(g, args.author, "add %s: %s" % (args.type, args.title), nid)
+    if args.parent:
+        pid = resolve(g, args.parent)
+        rel = args.rel or ("implements" if args.type == "task" else "relates_to")
+        add_edge(g, nid, pid, rel)
+    save_graph(root, g)
+    print(nid)
+
+
+def cmd_link(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    src, dst = resolve(g, args.src), resolve(g, args.dst)
+    rel = args.rel
+    if rel not in EDGE_RELS:
+        sys.stderr.write("weave: note - '%s' is not a standard rel\n" % rel)
+    if add_edge(g, src, dst, rel):
+        log_event(g, "human", "link %s -%s-> %s" % (src, rel, dst))
+        save_graph(root, g)
+        print("linked %s -%s-> %s" % (src, rel, dst))
+    else:
+        print("edge already exists")
+
+
+def cmd_unlink(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    src, dst = resolve(g, args.src), resolve(g, args.dst)
+    before = len(g["edges"])
+    g["edges"] = [e for e in g["edges"] if not (
+        e["from"] == src and e["to"] == dst and
+        (args.rel is None or e["rel"] == args.rel))]
+    if len(g["edges"]) < before:
+        save_graph(root, g)
+        print("removed %d edge(s)" % (before - len(g["edges"])))
+    else:
+        print("no matching edge")
+
+
+def cmd_set(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = resolve(g, args.node)
+    n = g["nodes"][nid]
+    changed = []
+    if args.status is not None:
+        n["status"] = args.status
+        changed.append("status=" + args.status)
+    if args.title is not None:
+        n["title"] = args.title
+        changed.append("title")
+    if args.body is not None:
+        n["body"] = args.body
+        changed.append("body")
+    if args.tags is not None:
+        n["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+        changed.append("tags")
+    if args.tier is not None:
+        if args.tier not in TIERS:
+            die("tier must be one of: " + ", ".join(TIERS))
+        n["tier"] = args.tier
+        changed.append("tier=" + args.tier)
+    if not changed:
+        die("nothing to set")
+    n["updated"] = now()
+    log_event(g, "human", "set %s [%s]" % (nid, ", ".join(changed)), nid)
+    save_graph(root, g)
+    print("updated %s: %s" % (nid, ", ".join(changed)))
+
+
+def _set_tier(root, ref, tier):
+    g = load_graph(root)
+    nid = resolve(g, ref)
+    n = g["nodes"][nid]
+    n["tier"] = tier
+    n["updated"] = now()
+    log_event(g, "human", "tier %s -> %s" % (nid, tier), nid)
+    save_graph(root, g)
+    print("%s -> tier=%s" % (nid, tier))
+
+
+def cmd_pin(args):
+    """Mark a node as pinned (always-surfaced in SessionStart hook)."""
+    root = find_root() or die("not a weave project")
+    _set_tier(root, args.node, "pinned")
+
+
+def cmd_archive(args):
+    """Mark a node as archived (excluded from status / SessionStart hook)."""
+    root = find_root() or die("not a weave project")
+    _set_tier(root, args.node, "archive")
+
+
+def cmd_unarchive(args):
+    """Restore an archived or pinned node to the active tier."""
+    root = find_root() or die("not a weave project")
+    _set_tier(root, args.node, "active")
+
+
+def cmd_rm(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = resolve(g, args.node)
+    title = g["nodes"][nid].get("title", "")
+    del g["nodes"][nid]
+    g["edges"] = [e for e in g["edges"]
+                  if e["from"] != nid and e["to"] != nid]
+    log_event(g, "human", "remove %s: %s" % (nid, title))
+    if get_focus(root) == nid:
+        set_focus(root, None)
+    save_graph(root, g)
+    print("removed %s" % nid)
+
+
+def cmd_focus(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    if args.node is None:
+        # no arg: show what's focused. don't silently clear important state -
+        # require an explicit keyword for that.
+        fid = get_focus(root)
+        if fid and fid in g["nodes"]:
+            n = g["nodes"][fid]
+            print("focus: %s  %s" % (fid, n.get("title", "")))
+        else:
+            print("focus: (none)")
+            print("  set:    weave focus <plan>")
+            print("  clear:  weave focus clear")
+        return
+    if args.node in ("-", "none", "clear"):
+        set_focus(root, None)
+        print("focus cleared")
+        return
+    nid = resolve(g, args.node)
+    set_focus(root, nid)
+    print("focus: %s  %s" % (nid, g["nodes"][nid].get("title", "")))
+
+
+def cmd_ls(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    rows = []
+    for nid, n in g["nodes"].items():
+        if args.type and n.get("type") != args.type:
+            continue
+        if args.status and n.get("status") != args.status:
+            continue
+        if args.tag and args.tag not in n.get("tags", []):
+            continue
+        if args.tier and n.get("tier", "active") != args.tier:
+            continue
+        rows.append((nid, n))
+    rows.sort(key=lambda r: r[1].get("updated", ""), reverse=True)
+    if not rows:
+        print("(no matching nodes)")
+        return
+    for nid, n in rows:
+        st = (" [%s]" % n["status"]) if n.get("status") else ""
+        tg = (" #" + ",".join(n["tags"])) if n.get("tags") else ""
+        print("%-8s %-9s %s%s%s" % (
+            nid, n.get("type", "?"), n.get("title", ""), st, tg))
+
+
+def _search_graph(g, q):
+    """Return [(nid, node)] for matches in g, newest-first."""
+    qlow = q.lower()
+    rows = []
+    for nid, n in g["nodes"].items():
+        hay = " ".join([n.get("title", ""), n.get("body", ""),
+                        " ".join(n.get("tags", []))]).lower()
+        if qlow in hay:
+            rows.append((nid, n))
+    rows.sort(key=lambda r: r[1].get("updated", ""), reverse=True)
+    return rows
+
+
+def _print_match(nid, n, q, indent=""):
+    st = (" [%s]" % n["status"]) if n.get("status") else ""
+    print("%s%-8s %-9s %s%s" % (
+        indent, nid, n.get("type", "?"), n.get("title", ""), st))
+    body = n.get("body", "")
+    idx = body.lower().find(q.lower())
+    if idx >= 0 and body:
+        s = max(0, idx - 24)
+        e = min(len(body), idx + len(q) + 56)
+        snippet = body[s:e].replace("\n", " ").strip()
+        if s > 0:
+            snippet = "..." + snippet
+        if e < len(body):
+            snippet = snippet + "..."
+        print(indent + "           " + snippet[:120])
+
+
+def cmd_search(args):
+    """Free-text search across node titles, bodies and tags. With --global
+    searches every project in the cross-machine index."""
+    if args.global_:
+        idx = _load_global_index()
+        projects = [pp for pp in idx.get("projects", [])
+                    if os.path.isdir(os.path.join(pp.get("path", ""),
+                                                   WEAVE_DIRNAME))]
+        if not projects:
+            print("(no projects registered for global search)")
+            return
+        total = 0
+        for pp in projects:
+            try:
+                g = json.load(open(os.path.join(pp["path"], WEAVE_DIRNAME,
+                                                 "graph.json"),
+                                    encoding="utf-8"))
+            except Exception:
+                continue
+            rows = _search_graph(g, args.query)
+            if not rows:
+                continue
+            print("=== %s  (%d match%s) ===" % (
+                pp.get("name", "?"), len(rows),
+                "" if len(rows) == 1 else "es"))
+            for nid, n in rows[:args.n]:
+                _print_match(nid, n, args.query, indent="  ")
+            total += len(rows)
+        if total == 0:
+            print("(no matches for '%s' across %d project(s))" % (
+                args.query, len(projects)))
+        return
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    rows = _search_graph(g, args.query)
+    if not rows:
+        print("(no matches for '%s')" % args.query)
+        return
+    print("%d match%s for '%s'" % (
+        len(rows), "" if len(rows) == 1 else "es", args.query))
+    for nid, n in rows[:args.n]:
+        _print_match(nid, n, args.query)
+
+
+def cmd_show(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = resolve(g, args.node)
+    n = g["nodes"][nid]
+    print("%s  (%s)" % (n.get("title", ""), nid))
+    print("type:    %s" % n.get("type"))
+    if n.get("status"):
+        print("status:  %s" % n["status"])
+    if n.get("path"):
+        print("path:    %s" % n["path"])
+    if n.get("tags"):
+        print("tags:    %s" % ", ".join(n["tags"]))
+    print("author:  %s   updated: %s" % (n.get("author"), n.get("updated")))
+    if n.get("body"):
+        print("\n%s\n" % n["body"])
+    out = [e for e in g["edges"] if e["from"] == nid]
+    inc = [e for e in g["edges"] if e["to"] == nid]
+    for e in out:
+        t = g["nodes"].get(e["to"], {})
+        print("  -%s-> %s  %s" % (e["rel"], e["to"], t.get("title", "?")))
+    for e in inc:
+        t = g["nodes"].get(e["from"], {})
+        print("  <-%s- %s  %s" % (e["rel"], e["from"], t.get("title", "?")))
+
+
+def cmd_status(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nodes = g["nodes"]
+    # archived nodes are excluded from the live dashboard - that's the point
+    # of the archive tier. They still exist on disk and in `weave ls --tier
+    # archive`, just not in the at-a-glance view.
+    live = {nid: n for nid, n in nodes.items()
+            if n.get("tier", "active") != "archive"}
+    pinned = [n for n in live.values() if n.get("tier") == "pinned"]
+    archived_n = len(nodes) - len(live)
+    by_type = {}
+    for n in live.values():
+        by_type[n["type"]] = by_type.get(n["type"], 0) + 1
+    tasks = {s: 0 for s in TASK_STATES}
+    for n in live.values():
+        if n["type"] == "task":
+            tasks[n.get("status", "todo")] = tasks.get(
+                n.get("status", "todo"), 0) + 1
+    questions = [(nid, n) for nid, n in live.items()
+                 if n["type"] == "question" and n.get("status") != "resolved"]
+    fid = get_focus(root)
+
+    print("weave \u00b7 %s" % g["meta"].get("project", "?"))
+    nl = "nodes %d \u00b7 edges %d \u00b7 rev %d" % (
+        len(live), len(g["edges"]), g["meta"].get("rev", 0))
+    if archived_n:
+        nl += "  (+%d archived)" % archived_n
+    print(nl)
+    if fid and fid in nodes:
+        print("focus: %s  (%s)" % (nodes[fid].get("title", ""), fid))
+    if pinned:
+        print("pinned: %d" % len(pinned))
+        for n in pinned[:5]:
+            print("  * %s  %s" % (n["id"], n.get("title", "")))
+    print("tasks: %d doing \u00b7 %d todo \u00b7 %d done \u00b7 %d blocked" % (
+        tasks.get("doing", 0), tasks.get("todo", 0),
+        tasks.get("done", 0), tasks.get("blocked", 0)))
+    if by_type:
+        print("types: " + " \u00b7 ".join(
+            "%d %s" % (v, k) for k, v in sorted(by_type.items())))
+    if questions:
+        print("open questions: %d" % len(questions))
+        for nid, n in questions[:6]:
+            print("  ? %s  %s (%s)" % (nid, n.get("title", ""),
+                                       n.get("author", "?")))
+    inbox = _inbox_files(root)
+    if inbox:
+        print("inbox: %d unread" % len(inbox))
+        for f in inbox[:6]:
+            print("  > %s" % f)
+    if g["log"]:
+        print("recent:")
+        for ev in g["log"][-6:]:
+            print("  %s  %-6s %s" % (short_ts(ev["ts"]),
+                                     ev["actor"], ev["action"]))
+
+
+def _inbox_files(root):
+    d = paths(root)["inbox"]
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for f in sorted(os.listdir(d)):
+        fp = os.path.join(d, f)
+        if os.path.isfile(fp) and not f.startswith("_") and f != "README.md":
+            out.append(f)
+    return out
+
+
+def cmd_inbox(args):
+    root = find_root() or die("not a weave project")
+    p = paths(root)
+    if args.file:
+        src = os.path.join(p["inbox"], args.file)
+        if not os.path.exists(src):
+            die("no inbox file '%s'" % args.file)
+        if args.done:
+            os.makedirs(p["archive"], exist_ok=True)
+            os.replace(src, os.path.join(
+                p["archive"], time.strftime("%Y%m%d-") + args.file))
+            print("archived %s" % args.file)
+        else:
+            print(open(src, encoding="utf-8").read())
+        return
+    files = _inbox_files(root)
+    if not files:
+        print("inbox empty")
+        return
+    for f in files:
+        fp = os.path.join(p["inbox"], f)
+        first = ""
+        try:
+            for line in open(fp, encoding="utf-8"):
+                if line.strip():
+                    first = line.strip()[:70]
+                    break
+        except Exception:
+            pass
+        print("%-28s %s" % (f, first))
+
+
+def cmd_note(args):
+    """Quick human note into the graph (you -> Claude)."""
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = new_id()
+    text = " ".join(args.text)
+    g["nodes"][nid] = {
+        "id": nid, "type": "note", "title": text[:60],
+        "body": text, "status": "", "tags": ["from-human"],
+        "path": "", "author": "human", "created": now(), "updated": now(),
+    }
+    log_event(g, "human", "note: " + text[:60], nid)
+    fid = get_focus(root)
+    if fid and fid in g["nodes"]:
+        add_edge(g, nid, fid, "relates_to")
+    save_graph(root, g)
+    print(nid)
+
+
+def cmd_log(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    for ev in g["log"][-args.n:]:
+        print("%s  %-6s %s" % (short_ts(ev["ts"]), ev["actor"], ev["action"]))
+
+
+def _list_versions(vdir: str):
+    if not os.path.isdir(vdir):
+        return []
+    return sorted(f for f in os.listdir(vdir) if f.endswith(".json"))
+
+
+def cmd_projects(args):
+    """List/manage the cross-machine weave project index (~/.weave_index.json)."""
+    idx = _load_global_index()
+    if args.add:
+        root = os.path.abspath(args.add)
+        if not os.path.isdir(os.path.join(root, WEAVE_DIRNAME)):
+            die("not a weave project (no .weave/): %s" % root)
+        try:
+            g = json.load(open(os.path.join(root, WEAVE_DIRNAME, "graph.json"),
+                               encoding="utf-8"))
+            name = g.get("meta", {}).get("project", os.path.basename(root))
+        except Exception:
+            name = os.path.basename(root)
+        _register_project(root, name)
+        print("registered: %s  (%s)" % (name, root))
+        return
+    if args.remove:
+        target = os.path.abspath(args.remove)
+        before = len(idx["projects"])
+        idx["projects"] = [p for p in idx["projects"]
+                           if os.path.abspath(p.get("path", "")) != target]
+        _save_global_index(idx)
+        print("removed %d project(s)" % (before - len(idx["projects"])))
+        return
+    if args.prune:
+        before = len(idx["projects"])
+        idx["projects"] = [p for p in idx["projects"]
+                           if os.path.isdir(os.path.join(p.get("path", ""),
+                                                          WEAVE_DIRNAME))]
+        _save_global_index(idx)
+        print("pruned %d stale entries" % (before - len(idx["projects"])))
+        return
+    projects = idx.get("projects", [])
+    if not projects:
+        print("(no weave projects registered yet)")
+        print("they auto-register on `weave init`; add manually with "
+              "`weave projects --add <path>`")
+        return
+    print("%-28s %-12s %-9s %s" % ("name", "rev/nodes", "focus", "path"))
+    for p in sorted(projects, key=lambda x: x.get("last_seen", ""),
+                    reverse=True):
+        rp = p.get("path", "")
+        gp = os.path.join(rp, WEAVE_DIRNAME, "graph.json")
+        stats, focus_title = "(missing)", ""
+        if os.path.exists(gp):
+            try:
+                g = json.load(open(gp, encoding="utf-8"))
+                stats = "r%d/%dn" % (g["meta"].get("rev", 0), len(g["nodes"]))
+                fp = os.path.join(rp, WEAVE_DIRNAME, "focus")
+                if os.path.exists(fp):
+                    fid = open(fp).read().strip()
+                    if fid in g["nodes"]:
+                        focus_title = g["nodes"][fid].get("title", "")[:9]
+            except Exception:
+                pass
+        print("%-28s %-12s %-9s %s" % (
+            p.get("name", "?")[:28], stats, focus_title, rp))
+
+
+def _git(root, *args):
+    try:
+        return subprocess.run(["git", "-C", root] + list(args),
+                              capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, OSError) as e:
+        die("git not available: %s" % e)
+
+
+def _link_one_commit(g, root, sha, fid, file_by_path):
+    """Link a single git commit as a milestone in g. Returns (nid, action)
+    where action is 'created', 'skipped' (already linked), or 'missing'."""
+    r = _git(root, "log", "-1",
+             "--format=%H%x1f%s%x1f%an%x1f%ad", "--date=short", sha)
+    if r.returncode != 0:
+        return (None, "missing")
+    parts = r.stdout.strip().split("\x1f")
+    if len(parts) < 4:
+        return (None, "missing")
+    full_sha, subject, author, date = parts[0], parts[1], parts[2], parts[3]
+    short = full_sha[:8]
+    for nid, n in g["nodes"].items():
+        if n.get("type") == "milestone" and n.get("path") == full_sha:
+            return (nid, "skipped")
+    nid = new_id()
+    g["nodes"][nid] = {
+        "id": nid, "type": "milestone",
+        "title": "[%s] %s" % (short, subject[:80]),
+        "body": "git commit %s\nauthor: %s\ndate: %s\n\n%s" % (
+            full_sha, author, date, subject),
+        "status": "", "tags": ["git", short], "path": full_sha,
+        "author": "claude", "tier": "active",
+        "created": now(), "updated": now(),
+    }
+    log_event(g, "claude",
+              "git-link: %s %s" % (short, subject[:60]), nid)
+    if fid and fid in g["nodes"]:
+        add_edge(g, nid, fid, "relates_to")
+    # Link to file nodes whose path appears in this commit's diff. Create
+    # file nodes for paths not yet tracked (so the milestone never points
+    # into thin air), but skip noise: weave's own dirs, build output,
+    # extensionless dotfiles like .gitignore.
+    rf = _git(root, "show", "--pretty=", "--name-only", full_sha)
+    if rf.returncode == 0:
+        files_changed = [ln.strip().replace("\\", "/")
+                         for ln in rf.stdout.strip().split("\n") if ln.strip()]
+        for fp in files_changed:
+            if fp.startswith(WEAVE_DIRNAME + "/") or fp == WEAVE_DIRNAME:
+                continue
+            parts = fp.split("/")
+            if any(p in SKIP_DIRS for p in parts):
+                continue
+            ext = os.path.splitext(fp)[1].lower()
+            if ext not in SCAN_EXTS:
+                # if the file is already tracked, still link to it
+                if fp not in file_by_path:
+                    continue
+            tgt = file_by_path.get(fp)
+            if not tgt:
+                tgt = upsert_file_node(g, root, fp, "git")
+                file_by_path[fp] = tgt
+            add_edge(g, nid, tgt, "produces")
+    return (nid, "created")
+
+
+def cmd_commit(args):
+    """Link git commit(s) as milestone node(s) in the graph.
+
+    Default: HEAD only.
+    --since <ref>: every commit reachable in <ref>..HEAD (oldest first).
+    Each milestone gets `relates_to` -> focus plan, and `produces` edges
+    to any file nodes whose paths the commit touched."""
+    root = find_root() or die("not a weave project")
+    if args.since:
+        r = _git(root, "rev-list", "--reverse", "%s..HEAD" % args.since)
+        if r.returncode != 0:
+            die("git: %s" % (r.stderr.strip() or "rev-list failed"))
+        shas = [s for s in r.stdout.strip().split("\n") if s]
+        if not shas:
+            print("no commits in %s..HEAD" % args.since)
+            return
+    else:
+        shas = [args.sha or "HEAD"]
+    g = load_graph(root)
+    fid = get_focus(root)
+    file_by_path = {n.get("path"): nid
+                    for nid, n in g["nodes"].items()
+                    if n.get("type") == "file" and n.get("path")}
+    created = skipped = 0
+    last_nid = last_short = None
+    for sha in shas:
+        nid, action = _link_one_commit(g, root, sha, fid, file_by_path)
+        if action == "created":
+            created += 1
+            last_nid = nid
+            last_short = g["nodes"][nid].get("path", "")[:8]
+        elif action == "skipped":
+            skipped += 1
+    if created or skipped:
+        save_graph(root, g)
+    extra = "  (%d already linked)" % skipped if skipped else ""
+    if created == 1:
+        print("milestone %s for git %s  %s%s" % (
+            last_nid, last_short,
+            g["nodes"][last_nid].get("title", "")[:60], extra))
+    elif created == 0:
+        print("nothing new linked%s" % extra)
+    else:
+        print("linked %d commit(s)%s" % (created, extra))
+
+
+def cmd_history(args):
+    """Recent graph snapshots (one written per save, oldest rotated out)."""
+    root = find_root() or die("not a weave project")
+    vdir = paths(root)["versions"]
+    files = _list_versions(vdir)
+    if not files:
+        print("(no version history yet; snapshots are written on each save)")
+        return
+    rows = files[-args.n:][::-1]
+    print("%-7s %-16s %s" % ("rev", "saved", "last action"))
+    for f in rows:
+        rev = int(f.split(".")[0])
+        fp = os.path.join(vdir, f)
+        try:
+            mt = datetime.fromtimestamp(os.path.getmtime(fp))
+            g = json.load(open(fp, encoding="utf-8"))
+            log = g.get("log", [])
+            last = log[-1].get("action", "") if log else ""
+        except Exception:
+            mt, last = None, ""
+        ts = mt.strftime("%m-%d %H:%M") if mt else "?"
+        print("%-7d %-16s %s" % (rev, ts, last[:80]))
+
+
+def cmd_undo(args):
+    """Restore the previous graph snapshot. With --to <rev>, jump to that
+    snapshot specifically. The restored state is itself saved (and snapshot),
+    so undo is reversible: re-`undo` keeps walking back; you can also undo
+    --to a more-recent rev to redo."""
+    root = find_root() or die("not a weave project")
+    p = paths(root)
+    vdir = p["versions"]
+    files = _list_versions(vdir)
+    if not files:
+        die("no version history yet - nothing to undo")
+    cur = load_graph(root)
+    cur_rev = cur["meta"].get("rev", 0)
+
+    if args.to is not None:
+        target = "%07d.json" % args.to
+        if target not in files:
+            die("no snapshot for rev %d (try `weave history`)" % args.to)
+    else:
+        # walk back from current rev to find the most-recent earlier snapshot
+        target = None
+        for f in reversed(files):
+            if int(f.split(".")[0]) < cur_rev:
+                target = f
+                break
+        if target is None:
+            die("no earlier snapshot to undo to "
+                "(current rev %d)" % cur_rev)
+
+    g = json.load(open(os.path.join(vdir, target), encoding="utf-8"))
+    restored_rev = g["meta"].get("rev", 0)
+    # let save_graph bump rev forward; preserve restored content
+    g["meta"]["rev"] = cur_rev
+    log_event(g, args.actor or "human",
+              "undo: restored rev %d" % restored_rev)
+    save_graph(root, g)
+    print("undo: restored rev %d (new rev %d, %d nodes, %d edges)" % (
+        restored_rev, g["meta"]["rev"], len(g["nodes"]), len(g["edges"])))
+
+
+def cmd_sync(args):
+    """Refresh file nodes. --scan imports all source files; --tree builds
+    folder nodes mirroring the directory tree; --prune-missing removes nodes
+    whose files no longer exist on disk. --scan also detects renames by
+    matching the content hash of new files to nodes already marked missing."""
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    refreshed = missing = added = folders = renamed = pruned = 0
+
+    for nid, n in list(g["nodes"].items()):
+        if n.get("type") != "file" or not n.get("path"):
+            continue
+        ap = os.path.join(root, n["path"])
+        if os.path.exists(ap):
+            h = _file_hash(ap)
+            if h != n.get("hash"):
+                n["hash"] = h
+                n["updated"] = now()
+                refreshed += 1
+            n.pop("missing", None)
+        else:
+            if not n.get("missing"):
+                n["missing"] = True
+                missing += 1
+
+    build_tree = args.tree or args.scan
+    if args.scan:
+        existing = {n["path"]: n for n in g["nodes"].values()
+                    if n.get("type") == "file"}
+        # hash -> [missing nodes]: used for rename detection (same content,
+        # new location). Skip empty/missing hashes.
+        missing_by_hash = {}
+        for n in existing.values():
+            h = n.get("hash")
+            if n.get("missing") and h:
+                missing_by_hash.setdefault(h, []).append(n)
+
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if os.path.splitext(fn)[1].lower() not in SCAN_EXTS:
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                rel = rel.replace("\\", "/")
+                if rel in existing:
+                    continue
+                count += 1
+                if count > 3000:
+                    sys.stderr.write("weave: scan cap reached (3000)\n")
+                    break
+                # Rename detection: if the new file's hash matches exactly
+                # one missing node, repoint that node instead of creating
+                # a new one. Preserves all edges (reading lists etc).
+                h = _file_hash(os.path.join(dirpath, fn))
+                cand = missing_by_hash.get(h, []) if h else []
+                if len(cand) == 1:
+                    n = cand[0]
+                    old = n["path"]
+                    n["path"] = rel
+                    n["title"] = os.path.basename(rel)
+                    n.pop("missing", None)
+                    n["updated"] = now()
+                    log_event(g, "claude", "rename: %s -> %s" % (old, rel),
+                              n["id"])
+                    missing_by_hash[h] = []
+                    renamed += 1
+                else:
+                    upsert_file_node(g, root, rel, "scan")
+                    added += 1
+            if count > 3000:
+                break
+
+    if args.prune_missing:
+        gone = [nid for nid, n in g["nodes"].items()
+                if n.get("type") == "file" and n.get("missing")]
+        for nid in gone:
+            del g["nodes"][nid]
+        if gone:
+            g["edges"] = [e for e in g["edges"]
+                          if e["from"] not in gone and e["to"] not in gone]
+        pruned = len(gone)
+
+    if build_tree:
+        folders = _rebuild_tree(g, root)
+
+    still_missing = sum(1 for n in g["nodes"].values()
+                        if n.get("type") == "file" and n.get("missing"))
+
+    summary = ("sync: +%d files" % added) + (
+        (", %d renamed" % renamed) if renamed else "") + (
+        (", %d refreshed" % refreshed) if refreshed else "") + (
+        (", %d pruned" % pruned) if pruned else "") + (
+        (", %d folders" % folders) if folders else "")
+    log_event(g, "claude", summary)
+    save_graph(root, g)
+    print(summary + ((" (%d still missing)" % still_missing)
+                     if still_missing else ""))
+
+
+def _rebuild_tree(g: dict, root: str) -> int:
+    """Create folder nodes for every directory holding tracked files, and
+    `contains` edges parent->child. Returns folder node count."""
+    file_nodes = [(nid, n) for nid, n in g["nodes"].items()
+                  if n.get("type") == "file" and n.get("path")]
+    dirs = set()
+    for _, n in file_nodes:
+        d = os.path.dirname(n["path"])
+        while True:
+            dirs.add(d or ".")
+            if not d:
+                break
+            d = os.path.dirname(d)
+    folder_id = {}
+    for d in dirs:
+        folder_id[d or "."] = upsert_folder_node(g, d or ".")
+    # drop folder nodes no longer backed by tracked files
+    for nid, n in list(g["nodes"].items()):
+        if n.get("type") == "folder" and n.get("path") not in folder_id:
+            del g["nodes"][nid]
+            g["edges"] = [e for e in g["edges"]
+                          if e["from"] != nid and e["to"] != nid]
+    # parent folder -> child folder
+    for d, fid in folder_id.items():
+        if d == ".":
+            continue
+        parent = os.path.dirname(d) or "."
+        if parent in folder_id:
+            add_edge(g, folder_id[parent], fid, "contains")
+    # folder -> file
+    for nid, n in file_nodes:
+        d = os.path.dirname(n["path"]) or "."
+        if d in folder_id:
+            add_edge(g, folder_id[d], nid, "contains")
+    return len(folder_id)
+
+
+def cmd_attach(args):
+    """Route files/folders to a task or plan: edge <node> -reads-> <target>."""
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = resolve(g, args.node)
+    attached = []
+    for tref in args.targets:
+        tid = _resolve_target(g, root, tref)
+        if add_edge(g, nid, tid, "reads"):
+            attached.append(g["nodes"][tid].get("title", tid))
+    log_event(g, "human", "attach %d -> %s" % (len(attached), nid), nid)
+    save_graph(root, g)
+    if attached:
+        print("attached to %s: %s" % (nid, ", ".join(attached)))
+    else:
+        print("nothing new attached")
+
+
+def cmd_detach(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = resolve(g, args.node)
+    removed = 0
+    for tref in args.targets:
+        tid = _resolve_target(g, root, tref, create=False)
+        before = len(g["edges"])
+        g["edges"] = [e for e in g["edges"] if not (
+            e["from"] == nid and e["to"] == tid and e["rel"] == "reads")]
+        removed += before - len(g["edges"])
+    save_graph(root, g)
+    print("detached %d reading link(s) from %s" % (removed, nid))
+
+
+def _resolve_target(g, root, ref, create=True):
+    """Resolve an attach target: existing node, or a real file path that
+    gets turned into a file node on the fly."""
+    if ref in g["nodes"]:
+        return ref
+    cand = ref.replace("\\", "/").rstrip("/")
+    ap = os.path.join(root, cand)
+    if os.path.isfile(ap):
+        return upsert_file_node(g, root, cand, "human")
+    if os.path.isdir(ap):
+        if create:
+            _rebuild_tree(g, root)
+        return upsert_folder_node(g, cand)
+    return resolve(g, ref)
+
+
+def cmd_context(args):
+    """Print the reading list for a node - the files Claude should load."""
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    nid = resolve(g, args.node)
+    n = g["nodes"][nid]
+    rl = reading_list(g, nid)
+    if args.json:
+        print(json.dumps({
+            "node": nid, "title": n.get("title", ""),
+            "files": [{"path": p, "via": v} for p, v in rl]}, indent=2))
+        return
+    print("context for %s  (%s)" % (n.get("title", ""), nid))
+    if not rl:
+        print("  (no reading list - attach files with `weave attach`)")
+        return
+    for p, via in rl:
+        mark = "" if os.path.exists(os.path.join(root, p)) else "  [missing]"
+        print("  %s%s   <- %s" % (p, mark, via))
+
+
+def cmd_demo(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    if g["nodes"]:
+        die("graph not empty - demo only seeds an empty graph")
+
+    def mk(t, title, body="", status="", author="claude", tags=None):
+        nid = new_id()
+        g["nodes"][nid] = {
+            "id": nid, "type": t, "title": title, "body": body,
+            "status": status, "tags": tags or [], "path": "",
+            "author": author, "created": now(), "updated": now()}
+        return nid
+
+    ms = mk("milestone", "v0.1 working slice", "First end-to-end demo.")
+    plan = mk("plan", "Cooperation graph MVP",
+              "Build the shared graph + live workspace.")
+    t1 = mk("task", "Define graph schema", status="done")
+    t2 = mk("task", "Build the CLI", status="doing")
+    t3 = mk("task", "Live browser workspace", status="todo")
+    t4 = mk("task", "Claude Code hooks", status="blocked")
+    dec = mk("decision", "JSON file as the store",
+             "Plain JSON: git-diffable, Claude reads it natively, zero deps.")
+    f1 = mk("file", "weave", tags=["cli"])
+    g["nodes"][f1]["path"] = "weave"
+    f2 = mk("file", "graph.json", tags=["schema"])
+    g["nodes"][f2]["path"] = ".weave/graph.json"
+    q = mk("question", "Auto-sync every repo file, or only touched ones?",
+           "Touched-only keeps the graph meaningful; --scan does full import.",
+           author="claude")
+    note = mk("note", "Keep graph.json committed to git",
+              "It is shared project memory - it should travel with the repo.",
+              author="human", tags=["from-human"])
+
+    for s, d, r in [(plan, ms, "implements"), (t1, plan, "implements"),
+                    (t2, plan, "implements"), (t3, plan, "implements"),
+                    (t4, plan, "implements"), (dec, plan, "relates_to"),
+                    (f1, t2, "produces"), (q, t3, "relates_to"),
+                    (t4, t2, "depends_on"), (note, plan, "relates_to"),
+                    (t2, f1, "reads"), (t1, f2, "reads")]:
+        add_edge(g, s, d, r)
+
+    set_focus(root, plan)
+    log_event(g, "claude", "seeded demo graph")
+    save_graph(root, g)
+    print("seeded %d nodes. run:  weave serve" % len(g["nodes"]))
+
+
+def cmd_view(args):
+    root = find_root() or die("not a weave project")
+    g = load_graph(root)
+    html = render_html(mode="static", data=g)
+    out = paths(root)["html"]
+    open(out, "w", encoding="utf-8").write(html)
+    print("wrote %s" % out)
+    if not args.no_open:
+        webbrowser.open("file://" + out)
+
+
+def cmd_serve(args):
+    root = find_root() or die("not a weave project")
+    serve(root, args.port, not args.no_open)
+
+
+def cmd_hook_session(args):
+    """SessionStart hook: print compact state into Claude's context."""
+    root = find_root()
+    if not root:
+        return
+    g = load_graph(root)
+    nodes = g["nodes"]
+    p = paths(root)
+    # Memory tiers: skip archived nodes entirely, surface pinned nodes
+    # before the routine status. Keeps the hook payload lean as the graph grows.
+    def _live(n):
+        return n.get("tier", "active") != "archive"
+    live = [n for n in nodes.values() if _live(n)]
+    pinned = [n for n in live if n.get("tier") == "pinned"]
+    tasks = [n for n in live if n["type"] == "task"]
+    doing = [n for n in tasks if n.get("status") == "doing"]
+    blocked = [n for n in tasks if n.get("status") == "blocked"]
+    todo = [n for n in tasks if n.get("status") == "todo"]
+    qs = [n for n in live
+          if n["type"] == "question" and n.get("status") != "resolved"]
+    inbox = _inbox_files(root)
+    fid = get_focus(root)
+
+    # Rollup: which files Claude touched since the last SessionStart fire.
+    # PostToolUse stays silent per-edit; this surfaces the delta once.
+    seen_session_fp = os.path.join(p["weave"], ".seen_session")
+    last_ts = None
+    if os.path.exists(seen_session_fp):
+        try:
+            last_ts = json.load(open(seen_session_fp)).get("ts")
+        except Exception:
+            pass
+    try:
+        json.dump({"ts": now()}, open(seen_session_fp, "w"))
+    except Exception:
+        pass
+    touched = []
+    if last_ts:
+        touched = [n for n in nodes.values()
+                   if n.get("type") == "file"
+                   and n.get("author") == "claude"
+                   and n.get("updated", "") > last_ts]
+
+    lines = ["[weave] shared project graph: .weave/graph.json  "
+             "(%d nodes, rev %d)" % (len(nodes), g["meta"].get("rev", 0))]
+    if touched:
+        names = ", ".join(n.get("title", "?") for n in touched[:5])
+        more = " (+%d more)" % (len(touched) - 5) if len(touched) > 5 else ""
+        lines.append("  since last session: %d file(s) touched - %s%s" % (
+            len(touched), names, more))
+    if fid and fid in nodes:
+        lines.append("  focus plan: %s (%s)" % (nodes[fid]["title"], fid))
+    if pinned:
+        lines.append("  pinned: " + "; ".join(
+            "%s (%s)" % (n.get("title", ""), n["id"]) for n in pinned[:5]))
+    if doing:
+        lines.append("  in progress: " + "; ".join(
+            "%s (%s)" % (n["title"], n["id"]) for n in doing[:5]))
+    if blocked:
+        lines.append("  blocked: " + "; ".join(
+            "%s (%s)" % (n["title"], n["id"]) for n in blocked[:5]))
+    if todo:
+        lines.append("  todo: %d task(s)" % len(todo))
+    if qs:
+        lines.append("  open questions: " + "; ".join(
+            "%s (%s)" % (n["title"], n["id"]) for n in qs[:5]))
+    if inbox:
+        lines.append("  inbox: %d unread - run `weave inbox`" % len(inbox))
+
+    # context routing: reading list for the focus node and active tasks
+    route_for = []
+    if fid and fid in nodes:
+        route_for.append(fid)
+    for n in doing[:3]:
+        if n["id"] not in route_for:
+            route_for.append(n["id"])
+    emitted = False
+    for rid in route_for:
+        rl = reading_list(g, rid)
+        if not rl:
+            continue
+        if not emitted:
+            lines.append("  -- reading lists (load these for the work) --")
+            emitted = True
+        paths_str = ", ".join(p for p, _ in rl[:12])
+        more = "  (+%d more)" % (len(rl) - 12) if len(rl) > 12 else ""
+        lines.append("  read for %s: %s%s" % (
+            nodes[rid]["title"], paths_str, more))
+    if route_for and not emitted:
+        lines.append("  tip: attach files to tasks (`weave attach <task> "
+                      "<paths>`) so reading lists route automatically.")
+
+    # sibling projects: mention up to 3 other recently-touched weave projects
+    try:
+        idx = _load_global_index()
+        root_abs = os.path.abspath(root)
+        siblings = [pp for pp in idx.get("projects", [])
+                    if os.path.abspath(pp.get("path", "")) != root_abs
+                    and os.path.isdir(os.path.join(pp.get("path", ""),
+                                                    WEAVE_DIRNAME))]
+        siblings.sort(key=lambda pp: pp.get("last_seen", ""), reverse=True)
+        if siblings:
+            names = ", ".join(pp.get("name", "?") for pp in siblings[:3])
+            extra = " (+%d more)" % (len(siblings) - 3) if len(siblings) > 3 else ""
+            lines.append("  sibling weave projects: " + names + extra +
+                          " - `weave projects`")
+    except Exception:
+        pass
+
+    lines.append("  maintain it: `weave add/set/link/attach`, "
+                 "`weave context <task>`. See CLAUDE.md weave section.")
+    print("\n".join(lines))
+
+
+def cmd_hook_postuse(args):
+    """PostToolUse hook: auto-register files Claude writes/edits."""
+    root = find_root()
+    if not root:
+        return
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+    ti = payload.get("tool_input", {}) or {}
+    fp = ti.get("file_path") or ti.get("path")
+    if not fp:
+        return
+    try:
+        rel = os.path.relpath(os.path.abspath(fp), root)
+    except Exception:
+        return
+    if rel.startswith("..") or rel.startswith(WEAVE_DIRNAME):
+        return
+    if os.path.splitext(rel)[1].lower() not in SCAN_EXTS:
+        return
+    g = load_graph(root)
+    nid = upsert_file_node(g, root, rel, "claude")
+    fid = get_focus(root)
+    if fid and fid in g["nodes"]:
+        add_edge(g, fid, nid, "produces")
+    save_graph(root, g)
+
+
+def cmd_hook_pretool(args):
+    """PreToolUse hook: before each tool call, surface graph changes the
+    human made since Claude last looked - so Claude sees mid-task edits.
+
+    Emits JSON with hookSpecificOutput.additionalContext when (and only when)
+    something changed, keeping injected context tiny."""
+    root = find_root()
+    if not root:
+        return
+    p = paths(root)
+    seen_fp = os.path.join(p["weave"], ".seen_rev")
+    g = load_graph(root)
+    rev = g["meta"].get("rev", 0)
+
+    last_rev = -1
+    last_log = 0
+    if os.path.exists(seen_fp):
+        try:
+            prev = json.load(open(seen_fp))
+            last_rev = prev.get("rev", -1)
+            last_log = prev.get("log_len", 0)
+        except Exception:
+            pass
+
+    log = g.get("log", [])
+    # write current marker first so we never double-report
+    try:
+        json.dump({"rev": rev, "log_len": len(log)}, open(seen_fp, "w"))
+    except Exception:
+        pass
+
+    if last_rev < 0 or rev == last_rev:
+        return  # first call this session, or nothing changed
+
+    # report only human-authored events since last look - that is what
+    # Claude could not otherwise know about. Inbox/signals are already
+    # surfaced at SessionStart; only re-surface them alongside a fresh
+    # human event, otherwise we'd nag on every tool call for the rest of
+    # the session.
+    fresh = [ev for ev in log[last_log:] if ev.get("actor") == "human"]
+    if not fresh:
+        return
+    inbox = _inbox_files(root)
+    signals = [n for n in g["nodes"].values()
+               if "for-claude" in n.get("tags", [])
+               and n.get("status") != "resolved"]
+
+    parts = ["[weave] the human changed the shared graph while you were "
+             "working:"]
+    for ev in fresh[-8:]:
+        parts.append("  - " + ev.get("action", ""))
+    for n in signals[:5]:
+        parts.append("  ! flagged for you: %s (%s) - %s"
+                      % (n.get("title", ""), n.get("id"),
+                         (n.get("body", "") or "")[:120]))
+    if inbox:
+        parts.append("  - inbox: %d unread message(s); run `weave inbox`"
+                     % len(inbox))
+    parts.append("Reconsider current work in light of this if relevant.")
+
+    out = {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": "\n".join(parts)}}
+    print(json.dumps(out))
+
+
+# --------------------------------------------------------------------------
+# mcp server  (native weave tools for Claude, stdio JSON-RPC 2.0, no deps)
+# --------------------------------------------------------------------------
+MCP_TOOLS = [
+    {
+        "name": "weave_status",
+        "description": "Current state of the shared weave graph: focus plan, "
+        "tasks in progress / blocked / todo, open questions, unread inbox. "
+        "Call at the start of work and whenever you need orientation.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "weave_inbox",
+        "description": "Read messages the human left for you. Call when "
+        "weave_status reports unread inbox items.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "weave_add",
+        "description": "Add a node to the graph. Use 'plan' for a goal, "
+        "'task' for a step, 'decision' for a meaningful choice, 'milestone' "
+        "for a release, 'note' for context, 'file' for a tracked file. "
+        "Optionally link it to a parent node.",
+        "inputSchema": {"type": "object", "properties": {
+            "type": {"type": "string", "enum": NODE_TYPES},
+            "title": {"type": "string"},
+            "body": {"type": "string", "description": "detail / rationale"},
+            "tags": {"type": "string", "description": "comma-separated"},
+            "status": {"type": "string"},
+            "parent": {"type": "string",
+                       "description": "id or title of node to link to"},
+            "rel": {"type": "string", "enum": EDGE_RELS}},
+            "required": ["type", "title"]},
+    },
+    {
+        "name": "weave_set",
+        "description": "Update a node: change a task/question status, edit "
+        "title, body or tags. Mark tasks done as you complete them.",
+        "inputSchema": {"type": "object", "properties": {
+            "node": {"type": "string", "description": "id or title substring"},
+            "status": {"type": "string"},
+            "title": {"type": "string"},
+            "body": {"type": "string"},
+            "tags": {"type": "string", "description": "comma-separated"}},
+            "required": ["node"]},
+    },
+    {
+        "name": "weave_link",
+        "description": "Connect two nodes with a relationship edge.",
+        "inputSchema": {"type": "object", "properties": {
+            "from": {"type": "string"}, "to": {"type": "string"},
+            "rel": {"type": "string", "enum": EDGE_RELS}},
+            "required": ["from", "to", "rel"]},
+    },
+    {
+        "name": "weave_focus",
+        "description": "Set the active plan - the human sees it ringed in "
+        "the workspace. Pass an empty node to clear focus.",
+        "inputSchema": {"type": "object", "properties": {
+            "node": {"type": "string"}}},
+    },
+    {
+        "name": "weave_ls",
+        "description": "List nodes, optionally filtered by type, status, "
+        "or tag.",
+        "inputSchema": {"type": "object", "properties": {
+            "type": {"type": "string", "enum": NODE_TYPES},
+            "status": {"type": "string"}, "tag": {"type": "string"}}},
+    },
+    {
+        "name": "weave_show",
+        "description": "Show one node in full with all of its connections.",
+        "inputSchema": {"type": "object", "properties": {
+            "node": {"type": "string"}}, "required": ["node"]},
+    },
+    {
+        "name": "weave_attach",
+        "description": "Route files or folders to a task/plan as its reading "
+        "list. When this node is focused, weave tells you to load exactly "
+        "these files - so attach the files relevant to a task as you plan it.",
+        "inputSchema": {"type": "object", "properties": {
+            "node": {"type": "string",
+                     "description": "task/plan id or title"},
+            "targets": {"type": "array", "items": {"type": "string"},
+                        "description": "file/folder paths, or node ids"}},
+            "required": ["node", "targets"]},
+    },
+    {
+        "name": "weave_context",
+        "description": "Get the reading list for a task/plan: the exact files "
+        "to load for that work, inherited from parent plans plus its own. "
+        "Call this before starting a task to know what to read.",
+        "inputSchema": {"type": "object", "properties": {
+            "node": {"type": "string"}}, "required": ["node"]},
+    },
+    {
+        "name": "weave_ask",
+        "description": "Raise a question for the human. Creates a question "
+        "node so it appears in their workspace - use this when you need a "
+        "human decision, not only a chat message.",
+        "inputSchema": {"type": "object", "properties": {
+            "question": {"type": "string"},
+            "body": {"type": "string",
+                     "description": "context / your recommendation"},
+            "parent": {"type": "string"}},
+            "required": ["question"]},
+    },
+]
+
+
+def _run_cmd(fn, **kw):
+    """Invoke an existing cmd_ function, capturing its output as text."""
+    ns = argparse.Namespace(**kw)
+    out, errbuf = io.StringIO(), io.StringIO()
+    is_err = False
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errbuf):
+            fn(ns)
+    except SystemExit:
+        is_err = True
+    except Exception as e:
+        errbuf.write("weave: " + str(e))
+        is_err = True
+    text = (out.getvalue() + errbuf.getvalue()).strip()
+    return text or "(done)", is_err
+
+
+def _mcp_dispatch(name, a):
+    a = a or {}
+    if name == "weave_status":
+        return _run_cmd(cmd_status)
+    if name == "weave_inbox":
+        return _run_cmd(cmd_inbox, file=None, done=False)
+    if name == "weave_add":
+        if a.get("type") not in NODE_TYPES:
+            return ("error: type must be one of " + ", ".join(NODE_TYPES),
+                    True)
+        return _run_cmd(cmd_add, type=a.get("type"), title=a.get("title", ""),
+                        body=a.get("body"), tags=a.get("tags"),
+                        status=a.get("status"), path=None,
+                        parent=a.get("parent"), rel=a.get("rel"),
+                        author="claude")
+    if name == "weave_set":
+        return _run_cmd(cmd_set, node=a.get("node"), status=a.get("status"),
+                        title=a.get("title"), body=a.get("body"),
+                        tags=a.get("tags"))
+    if name == "weave_link":
+        return _run_cmd(cmd_link, src=a.get("from"), dst=a.get("to"),
+                        rel=a.get("rel"))
+    if name == "weave_focus":
+        return _run_cmd(cmd_focus, node=a.get("node") or None)
+    if name == "weave_ls":
+        return _run_cmd(cmd_ls, type=a.get("type"), status=a.get("status"),
+                        tag=a.get("tag"))
+    if name == "weave_show":
+        return _run_cmd(cmd_show, node=a.get("node"))
+    if name == "weave_attach":
+        tg = a.get("targets") or []
+        if isinstance(tg, str):
+            tg = [tg]
+        return _run_cmd(cmd_attach, node=a.get("node"), targets=tg)
+    if name == "weave_context":
+        return _run_cmd(cmd_context, node=a.get("node"), json=False)
+    if name == "weave_ask":
+        return _run_cmd(cmd_add, type="question",
+                        title=a.get("question", ""), body=a.get("body"),
+                        tags=None, status=None, path=None,
+                        parent=a.get("parent"), rel=None, author="claude")
+    return ("unknown tool: " + str(name), True)
+
+
+def _rpc_ok(mid, result):
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def _rpc_err(mid, code, msg):
+    return {"jsonrpc": "2.0", "id": mid,
+            "error": {"code": code, "message": msg}}
+
+
+def _handle_rpc(msg):
+    if not isinstance(msg, dict):
+        return None
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        return _rpc_ok(mid, {
+            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "weave", "version": "1.0.0"}})
+    if method and method.startswith("notifications/"):
+        return None
+    if method == "ping":
+        return _rpc_ok(mid, {})
+    if method == "tools/list":
+        return _rpc_ok(mid, {"tools": MCP_TOOLS})
+    if method == "tools/call":
+        try:
+            text, is_err = _mcp_dispatch(params.get("name"),
+                                         params.get("arguments"))
+        except Exception as e:
+            text, is_err = "weave error: " + str(e), True
+        return _rpc_ok(mid, {"content": [{"type": "text", "text": text}],
+                             "isError": bool(is_err)})
+    if mid is not None:
+        return _rpc_err(mid, -32601, "method not found: " + str(method))
+    return None
+
+
+def cmd_mcp(args):
+    """Run the weave MCP server over stdio. Launched by Claude Code."""
+    sys.stderr.write("weave: mcp server ready\n")
+    sys.stderr.flush()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(msg, list):                       # JSON-RPC batch
+            batch = [r for r in (_handle_rpc(m) for m in msg)
+                     if r is not None]
+            if batch:
+                sys.stdout.write(json.dumps(batch) + "\n")
+                sys.stdout.flush()
+            continue
+        try:
+            resp = _handle_rpc(msg)
+        except Exception as e:
+            resp = _rpc_err(msg.get("id"), -32603, str(e))
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# scaffolding writers
+# --------------------------------------------------------------------------
+def _detect_python():
+    """Pick the python command to use in hook/MCP wiring. Prefers python3,
+    falls back to python, then to the Windows `py` launcher. Detection
+    happens once per init - the chosen name is baked into the project's
+    .claude/settings.local.json and .mcp.json so it doesn't drift."""
+    for name in ("python3", "python", "py"):
+        if shutil.which(name):
+            return name
+    return "python3"  # leave a clear failure target if nothing was found
+
+
+PY_CMD = _detect_python()
+WEAVE_CMD = '%s "%s"' % (PY_CMD, SELF_PATH)
+
+CLAUDE_BLOCK = """<!-- weave:start -->
+## weave - shared cooperation graph
+
+This project has a **weave** graph at `.weave/graph.json`: the shared memory of
+plans, tasks, decisions, files and questions, used by both you and the human.
+
+**First clone of this repo?** Hook + MCP wiring lives in
+`.claude/settings.local.json` and `.mcp.json` (both gitignored - they bake
+absolute, per-machine paths). The graph file travels with the repo, the
+plumbing does not. Run `weave init` once after cloning and restart this
+session to pick up the MCP server and hooks.
+
+**Native tools:** if the weave MCP server is connected you have tools
+`weave_status`, `weave_inbox`, `weave_add`, `weave_set`, `weave_link`,
+`weave_focus`, `weave_ls`, `weave_show`, `weave_ask` - prefer them.
+Otherwise use the CLI:  `WEAVE`  (identical operations).
+
+**At session start** the weave hook prints current state. Also run
+`weave inbox` if it reports unread items - those are messages from the human.
+
+**Workflow:**
+- Before non-trivial work, run `weave status` to see focus, tasks, questions.
+- When you form a plan: `weave add plan "<title>" --body "<summary>"`, then add
+  a `task` node per step (`weave add task "<step>" --parent <planId>`), then
+  `weave focus <planId>`.
+- As work progresses: `weave set <taskId> --status doing|done|blocked`.
+- Record meaningful choices: `weave add decision "<choice>" --body "<why>"
+  --parent <planId>`.
+- Files you edit are auto-tracked into the graph by a hook - no action needed.
+- When you need a human decision, DO NOT just ask in chat - also create it so
+  it shows in their workspace:
+  `weave add question "<question>" --author claude --parent <planId>`.
+- Resolve it later with `weave set <questionId> --status resolved`.
+- Link related nodes: `weave link <from> <to> <rel>`
+  (rels: implements, depends_on, blocks, relates_to, supersedes, produces).
+- **Context routing:** attach the files a task needs with
+  `weave attach <taskId> <path>...` (paths or folder nodes). Before starting a
+  task run `weave context <taskId>` (or the `weave_context` tool) - it gives
+  you the exact reading list, inherited from parent plans plus the task's own.
+  The session hook prints reading lists for the focus plan and active tasks
+  automatically, so keep them attached and you always know what to load.
+
+**More commands worth knowing:**
+- `weave search "<text>"` - free-text across titles, bodies, tags.
+- `weave history` / `weave undo [--to <rev>]` - rolling snapshots; safe to
+  revert an accidental edit, then `undo --to <higher rev>` redoes it.
+- `weave pin <node>` / `weave archive <node>` - memory tiers. Archived
+  nodes are excluded from this hook and from `weave status`; pinned ones
+  are surfaced at the top.
+- `weave commit [<sha>|--since <ref>]` - record git commit(s) as milestones,
+  with `produces` edges to any tracked files the commits touched.
+- `weave projects` - other weave projects registered on this machine.
+- `weave sync --scan --prune-missing` - import disk files + drop nodes
+  whose paths no longer exist. `--scan` also auto-detects renames
+  (same content hash -> repointed, edges preserved).
+
+Keep the graph honest and current - it is what the human sees in
+`weave serve`, and what you read next session.
+<!-- weave:end -->
+"""
+
+COMMANDS = {
+    "weave-status.md":
+        "Run `weave status` and `weave inbox`. Summarize the current state of "
+        "the weave graph for me: focus, what is in progress, what is blocked, "
+        "and any open questions or unread inbox messages. Then propose the "
+        "single best next step.",
+    "weave-plan.md":
+        "Create a weave plan for: $ARGUMENTS\n\n"
+        "1. `weave add plan \"<title>\" --body \"<one-line goal>\"`.\n"
+        "2. Break it into 3-8 concrete tasks: for each, "
+        "`weave add task \"<step>\" --parent <planId>`.\n"
+        "3. Add `weave link` edges for any depends_on / blocks relationships.\n"
+        "4. `weave focus <planId>`.\n"
+        "5. Show me the plan with `weave show <planId>` and confirm before "
+        "implementing.",
+    "weave-sync.md":
+        "Run `weave sync` to refresh tracked files and detect missing ones. "
+        "If I ask for a full import, run `weave sync --scan`. Report what "
+        "changed.",
+    "weave-done.md":
+        "Mark weave work complete: $ARGUMENTS\n\n"
+        "Resolve the referenced task/question with `weave set <id> --status "
+        "done` (or `resolved`). Then run `weave status` and tell me what is "
+        "left on the current focus plan.",
+    "weave-attach.md":
+        "Build the reading list for a task: $ARGUMENTS\n\n"
+        "Decide which files and folders are needed for that task, then "
+        "`weave attach <taskId> <path>...`. Confirm with "
+        "`weave context <taskId>` and show me the resulting reading list.",
+    "weave-ask.md":
+        "I have an open question for the human. Create it in the graph so it "
+        "appears in their workspace: `weave add question \"<question>\" "
+        "--author claude --body \"<context / your recommendation>\" --parent "
+        "<focus plan id>`. Question: $ARGUMENTS",
+    "weave-search.md":
+        "Search the weave graph (titles, bodies, tags) for: $ARGUMENTS\n\n"
+        "Run `weave search \"$ARGUMENTS\"` (use the `weave_search` MCP tool "
+        "if available). Summarize the matches for me, grouped by node type, "
+        "and propose what to do with each.",
+    "weave-undo.md":
+        "Roll back the most recent graph change with `weave undo` (or "
+        "`weave undo --to <rev>` to jump to a specific snapshot from "
+        "`weave history`). Then run `weave status` and tell me what's "
+        "different. Use this when an edit or sync went wrong.",
+}
+
+
+def _write_claude_md(root, name):
+    fp = os.path.join(root, "CLAUDE.md")
+    block = CLAUDE_BLOCK.replace("WEAVE", WEAVE_CMD)
+    existing = ""
+    if os.path.exists(fp):
+        existing = open(fp, encoding="utf-8").read()
+    if "<!-- weave:start -->" in existing:
+        pre = existing.split("<!-- weave:start -->")[0]
+        post = existing.split("<!-- weave:end -->", 1)
+        post = post[1] if len(post) > 1 else ""
+        new = pre.rstrip() + "\n\n" + block + post
+    elif existing.strip():
+        new = existing.rstrip() + "\n\n" + block
+    else:
+        new = "# %s\n\n%s" % (name, block)
+    open(fp, "w", encoding="utf-8").write(new)
+
+
+def _write_commands(root):
+    d = os.path.join(root, ".claude", "commands")
+    os.makedirs(d, exist_ok=True)
+    for fn, body in COMMANDS.items():
+        open(os.path.join(d, fn), "w", encoding="utf-8").write(body + "\n")
+
+
+def _write_settings(root):
+    d = os.path.join(root, ".claude")
+    os.makedirs(d, exist_ok=True)
+    fp = os.path.join(d, "settings.local.json")
+    s = {}
+    if os.path.exists(fp):
+        try:
+            s = json.load(open(fp, encoding="utf-8"))
+        except Exception:
+            s = {}
+    hooks = s.setdefault("hooks", {})
+
+    sess_cmd = '%s _hook-session' % WEAVE_CMD
+    post_cmd = '%s _hook-postuse' % WEAVE_CMD
+    pre_cmd = '%s _hook-pretool' % WEAVE_CMD
+
+    def has(events, cmd):
+        for grp in events:
+            for h in grp.get("hooks", []):
+                if h.get("command") == cmd:
+                    return True
+        return False
+
+    sess = hooks.setdefault("SessionStart", [])
+    if not has(sess, sess_cmd):
+        sess.append({"hooks": [{"type": "command", "command": sess_cmd}]})
+
+    post = hooks.setdefault("PostToolUse", [])
+    if not has(post, post_cmd):
+        post.append({"matcher": "Write|Edit|MultiEdit",
+                     "hooks": [{"type": "command", "command": post_cmd}]})
+
+    pre = hooks.setdefault("PreToolUse", [])
+    if not has(pre, pre_cmd):
+        pre.append({"matcher": "*",
+                    "hooks": [{"type": "command", "command": pre_cmd}]})
+
+    open(fp, "w", encoding="utf-8").write(json.dumps(s, indent=2) + "\n")
+
+
+def _write_mcp_json(root):
+    fp = os.path.join(root, ".mcp.json")
+    cfg = {}
+    if os.path.exists(fp):
+        try:
+            cfg = json.load(open(fp, encoding="utf-8"))
+        except Exception:
+            cfg = {}
+    servers = cfg.setdefault("mcpServers", {})
+    servers["weave"] = {"command": PY_CMD, "args": [SELF_PATH, "mcp"]}
+    open(fp, "w", encoding="utf-8").write(json.dumps(cfg, indent=2) + "\n")
+
+
+def _write_gitignore(root):
+    fp = os.path.join(root, ".gitignore")
+    lines = []
+    if os.path.exists(fp):
+        lines = open(fp, encoding="utf-8").read().splitlines()
+    want = [".weave/graph.html", ".weave/inbox/_archive/",
+            ".weave/.seen_rev", ".weave/.seen_session", ".weave/.serve",
+            ".weave/versions/",
+            ".claude/settings.local.json", ".mcp.json"]
+    add = [w for w in want if w not in lines]
+    if add:
+        with open(fp, "a", encoding="utf-8") as f:
+            if lines and lines[-1].strip():
+                f.write("\n")
+            f.write("# weave\n" + "\n".join(add) + "\n")
+
+
+# --------------------------------------------------------------------------
+# live server
+# --------------------------------------------------------------------------
+def serve(root, port, do_open):
+    state = {"root": root}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body.encode("utf-8") if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/":
+                self._send(200, render_html(mode="live", data=None),
+                           "text/html; charset=utf-8")
+            elif path == "/api/graph":
+                g = load_graph(state["root"])
+                rev = None
+                if "?" in self.path:
+                    q = self.path.split("?", 1)[1]
+                    for kv in q.split("&"):
+                        if kv.startswith("rev="):
+                            try:
+                                rev = int(kv[4:])
+                            except Exception:
+                                rev = None
+                if rev is not None and rev == g["meta"].get("rev"):
+                    self._send(200, json.dumps(
+                        {"unchanged": True, "rev": rev}))
+                else:
+                    g["focus"] = get_focus(state["root"])
+                    self._send(200, json.dumps(g))
+            elif path == "/api/projects":
+                # cross-project nav. Lists sibling weave projects with
+                # stats; probes any .serve marker's port to filter out
+                # stale markers from hard-killed serves. Sorted live-first,
+                # then by last_seen desc.
+                idx = _load_global_index()
+                here = os.path.abspath(state["root"])
+                out = []
+                for pp in idx.get("projects", []):
+                    p_abs = os.path.abspath(pp.get("path", ""))
+                    if not os.path.isdir(os.path.join(p_abs, WEAVE_DIRNAME)):
+                        continue
+                    info = {"path": p_abs,
+                            "name": pp.get("name", ""),
+                            "last_seen": pp.get("last_seen", ""),
+                            "is_self": p_abs == here}
+                    try:
+                        gp = os.path.join(p_abs, WEAVE_DIRNAME, "graph.json")
+                        gg = json.load(open(gp, encoding="utf-8"))
+                        info["rev"] = gg["meta"].get("rev", 0)
+                        info["nodes"] = len(gg.get("nodes", {}))
+                    except Exception:
+                        info["rev"], info["nodes"] = 0, 0
+                    sfp = os.path.join(p_abs, WEAVE_DIRNAME, ".serve")
+                    if os.path.exists(sfp):
+                        try:
+                            s = json.load(open(sfp, encoding="utf-8"))
+                            port = s.get("port")
+                            if port and _port_alive(port):
+                                info["serve_port"] = port
+                            else:
+                                # self-heal stale markers older than ~5 min.
+                                # Long enough that a slow startup or brief
+                                # network blip won't wipe a real serve;
+                                # short enough to keep the dropdown clean.
+                                age = time.time() - os.path.getmtime(sfp)
+                                if age > 300:
+                                    try:
+                                        os.remove(sfp)
+                                    except OSError:
+                                        pass
+                        except Exception:
+                            pass
+                    out.append(info)
+                # Sort live-first, then most-recently-seen first. Python
+                # sort is stable, so two passes (least-significant first):
+                out.sort(key=lambda x: x.get("last_seen", ""), reverse=True)
+                out.sort(key=lambda x: 0 if x.get("serve_port") else 1)
+                self._send(200, json.dumps({"projects": out}))
+            elif path == "/api/search":
+                # Free-text search powering the workspace deep/global search.
+                # Query params: q=<query>, global=1, n=<max>.
+                qp = {}
+                if "?" in self.path:
+                    for kv in self.path.split("?", 1)[1].split("&"):
+                        if "=" in kv:
+                            k, v = kv.split("=", 1)
+                            qp[k] = v
+                from urllib.parse import unquote_plus
+                q = unquote_plus(qp.get("q", ""))
+                if not q:
+                    self._send(200, json.dumps({"matches": []}))
+                    return
+                limit = max(1, min(200, int(qp.get("n", "30"))))
+                want_global = qp.get("global") in ("1", "true", "yes")
+                matches = []
+                total = 0
+                if want_global:
+                    idx = _load_global_index()
+                    for pp in idx.get("projects", []):
+                        gp = os.path.join(pp.get("path", ""),
+                                          WEAVE_DIRNAME, "graph.json")
+                        if not os.path.exists(gp):
+                            continue
+                        try:
+                            gg = json.load(open(gp, encoding="utf-8"))
+                        except Exception:
+                            continue
+                        sfp = os.path.join(pp.get("path", ""),
+                                           WEAVE_DIRNAME, ".serve")
+                        port = None
+                        if os.path.exists(sfp):
+                            try:
+                                ss = json.load(open(sfp, encoding="utf-8"))
+                                p2 = ss.get("port")
+                                if p2 and _port_alive(p2):
+                                    port = p2
+                            except Exception:
+                                pass
+                        rows = _search_graph(gg, q)
+                        total += len(rows)
+                        per_proj = max(1, limit // 4)
+                        for nid, n in rows[:per_proj]:
+                            if len(matches) >= limit:
+                                break
+                            matches.append({
+                                "id": nid, "type": n.get("type"),
+                                "title": n.get("title", ""),
+                                "status": n.get("status", ""),
+                                "project": pp.get("name", ""),
+                                "project_path": pp.get("path", ""),
+                                "serve_port": port,
+                            })
+                else:
+                    g = load_graph(state["root"])
+                    rows = _search_graph(g, q)
+                    total = len(rows)
+                    for nid, n in rows[:limit]:
+                        matches.append({
+                            "id": nid, "type": n.get("type"),
+                            "title": n.get("title", ""),
+                            "status": n.get("status", ""),
+                        })
+                self._send(200, json.dumps({"matches": matches,
+                                            "total": total,
+                                            "global": want_global,
+                                            "query": q}))
+            elif path == "/api/history":
+                # Snapshot history powering the workspace undo / history UI.
+                vdir = paths(state["root"])["versions"]
+                files = _list_versions(vdir)
+                cur_rev = load_graph(state["root"]
+                                     )["meta"].get("rev", 0)
+                # parse ?n=N (default 30, cap 50)
+                n = 30
+                if "?" in self.path:
+                    for kv in self.path.split("?", 1)[1].split("&"):
+                        if kv.startswith("n="):
+                            try:
+                                n = max(1, min(50, int(kv[2:])))
+                            except Exception:
+                                pass
+                out = []
+                for f in list(reversed(files))[:n]:
+                    rev = int(f.split(".")[0])
+                    fp = os.path.join(vdir, f)
+                    try:
+                        gg = json.load(open(fp, encoding="utf-8"))
+                        log = gg.get("log", [])
+                        last = log[-1].get("action", "") if log else ""
+                        out.append({"rev": rev,
+                                     "ts": gg["meta"].get("updated", ""),
+                                     "last": last[:100],
+                                     "nodes": len(gg.get("nodes", {})),
+                                     "is_current": rev == cur_rev})
+                    except Exception:
+                        pass
+                self._send(200, json.dumps({"history": out,
+                                            "current": cur_rev}))
+            elif path == "/api/stream":
+                self._stream()
+            else:
+                self._send(404, "{}")
+
+        def _stream(self):
+            """Server-sent events: push the graph the instant the file
+            changes. Watches mtime of graph.json + focus marker."""
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+            except Exception:
+                return
+            p = paths(state["root"])
+            last_sig = None
+            last_beat = time.time()
+
+            def sig():
+                s = []
+                for fp in (p["graph"], p["focus"]):
+                    try:
+                        s.append(os.stat(fp).st_mtime_ns)
+                    except OSError:
+                        s.append(0)
+                return tuple(s)
+
+            try:
+                while True:
+                    cur = sig()
+                    if cur != last_sig:
+                        last_sig = cur
+                        g = load_graph(state["root"])
+                        g["focus"] = get_focus(state["root"])
+                        msg = ("event: graph\ndata: %s\n\n"
+                               % json.dumps(g))
+                        self.wfile.write(msg.encode("utf-8"))
+                        self.wfile.flush()
+                        last_beat = time.time()
+                    elif time.time() - last_beat > 15:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last_beat = time.time()
+                    time.sleep(0.4)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+        def do_POST(self):
+            if self.path != "/api/op":
+                self._send(404, "{}")
+                return
+            try:
+                ln = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(ln) or b"{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "bad request"}))
+                return
+            try:
+                result = self._apply(req)
+                self._send(200, json.dumps(result))
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}))
+
+        def _apply(self, req):
+            root = state["root"]
+            g = load_graph(root)
+            op = req.get("op")
+            if op == "add_node":
+                nid = new_id()
+                t = req.get("type", "note")
+                g["nodes"][nid] = {
+                    "id": nid, "type": t, "title": req.get("title", ""),
+                    "body": req.get("body", ""),
+                    "status": req.get("status", "") or (
+                        "todo" if t == "task" else
+                        "open" if t == "question" else ""),
+                    "tags": req.get("tags", []), "path": "",
+                    "author": "human", "created": now(), "updated": now()}
+                log_event(g, "human", "add %s: %s" % (
+                    t, req.get("title", "")), nid)
+                if req.get("parent"):
+                    add_edge(g, nid, req["parent"],
+                             req.get("rel", "relates_to"))
+                save_graph(root, g)
+                return {"ok": True, "id": nid}
+            if op == "update_node":
+                nid = req["id"]
+                n = g["nodes"].get(nid)
+                if not n:
+                    return {"error": "no node"}
+                for k in ("title", "body", "status"):
+                    if k in req:
+                        n[k] = req[k]
+                if "tags" in req:
+                    n["tags"] = req["tags"]
+                if "tier" in req:
+                    if req["tier"] not in TIERS:
+                        return {"error": "invalid tier"}
+                    n["tier"] = req["tier"]
+                n["updated"] = now()
+                log_event(g, "human", "edit %s" % nid, nid)
+                save_graph(root, g)
+                return {"ok": True}
+            if op == "del_node":
+                nid = req["id"]
+                g["nodes"].pop(nid, None)
+                g["edges"] = [e for e in g["edges"]
+                              if e["from"] != nid and e["to"] != nid]
+                log_event(g, "human", "delete %s" % nid)
+                save_graph(root, g)
+                return {"ok": True}
+            if op == "add_edge":
+                add_edge(g, req["from"], req["to"],
+                         req.get("rel", "relates_to"))
+                log_event(g, "human", "link %s->%s" % (
+                    req["from"], req["to"]))
+                save_graph(root, g)
+                return {"ok": True}
+            if op == "del_edge":
+                g["edges"] = [e for e in g["edges"] if not (
+                    e["from"] == req["from"] and e["to"] == req["to"]
+                    and e["rel"] == req.get("rel", e["rel"]))]
+                save_graph(root, g)
+                return {"ok": True}
+            if op == "focus":
+                set_focus(root, req.get("id") or None)
+                return {"ok": True}
+            if op == "undo":
+                # workspace undo: same semantics as `weave undo [--to <rev>]`
+                p = paths(root)
+                vdir = p["versions"]
+                files = _list_versions(vdir)
+                if not files:
+                    return {"error": "no version history yet"}
+                cur = load_graph(root)
+                cur_rev = cur["meta"].get("rev", 0)
+                to = req.get("to")
+                if to is not None:
+                    target = "%07d.json" % int(to)
+                    if target not in files:
+                        return {"error": "no snapshot for rev %d" % int(to)}
+                else:
+                    target = None
+                    for f in reversed(files):
+                        if int(f.split(".")[0]) < cur_rev:
+                            target = f
+                            break
+                    if target is None:
+                        return {"error":
+                                "no earlier snapshot to undo to"}
+                gg = json.load(open(os.path.join(vdir, target),
+                                    encoding="utf-8"))
+                restored_rev = gg["meta"].get("rev", 0)
+                gg["meta"]["rev"] = cur_rev
+                log_event(gg, "human",
+                          "undo: restored rev %d" % restored_rev)
+                save_graph(root, gg)
+                return {"ok": True, "restored_rev": restored_rev,
+                        "new_rev": gg["meta"]["rev"],
+                        "nodes": len(gg["nodes"]),
+                        "edges": len(gg["edges"])}
+            if op == "sync":
+                # mirror cmd_sync but driven by JSON args. Returns the
+                # summary counts so the workspace can toast.
+                class _A:
+                    pass
+                a = _A()
+                a.scan = bool(req.get("scan"))
+                a.tree = bool(req.get("tree"))
+                a.prune_missing = bool(req.get("prune_missing"))
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    cmd_sync(a)
+                return {"ok": True, "summary": buf.getvalue().strip()}
+            if op == "commit":
+                # link a git commit (or range) - mirrors `weave commit`.
+                class _A:
+                    pass
+                a = _A()
+                a.sha = req.get("sha")
+                a.since = req.get("since")
+                buf = io.StringIO()
+                err_buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf), \
+                         contextlib.redirect_stderr(err_buf):
+                        cmd_commit(a)
+                except SystemExit as e:
+                    return {"error": (err_buf.getvalue().strip()
+                                       or "commit failed")}
+                return {"ok": True, "summary": buf.getvalue().strip()}
+            return {"error": "unknown op"}
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d/" % port
+    # Drop a .serve marker so OTHER weave workspaces can list us + offer
+    # to open this project in a new tab. Removed on clean shutdown.
+    serve_fp = os.path.join(paths(root)["weave"], ".serve")
+    try:
+        with open(serve_fp, "w") as f:
+            json.dump({"port": port, "pid": os.getpid(),
+                       "started": now()}, f)
+    except Exception:
+        pass
+    print("weave workspace live at %s   (Ctrl-C to stop)" % url)
+    if do_open:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nweave: stopped")
+        httpd.shutdown()
+    finally:
+        try:
+            os.remove(serve_fp)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# html workspace
+# --------------------------------------------------------------------------
+def render_html(mode: str, data) -> str:
+    payload = json.dumps(data) if data is not None else "null"
+    return HTML.replace("__WEAVE_MODE__", mode).replace(
+        "__WEAVE_DATA__", payload)
+
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>weave workspace</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+:root{
+  /* Apple Finance dark - Inter + JetBrains Mono */
+  --bg:#000000; --panel:#1c1c1e; --panel2:#2c2c2e; --line:#38383a;
+  --ink:#ffffff; --dim:#8e8e93; --faint:#48484a; --accent:#0a84ff;
+  --plan:#bf5af2; --task-todo:#8e8e93; --task-doing:#0a84ff;
+  --task-done:#30d158; --task-blocked:#ff453a; --file:#64d2ff;
+  --decision:#bf5af2; --note:#5e5ce6; --question:#ffd60a;
+  --milestone:#ff9f0a; --folder:#ac8e68;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--ink);overflow:hidden;
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',
+    'Helvetica Neue',Arial,sans-serif;
+  font-size:13px;-webkit-font-smoothing:antialiased;
+  font-feature-settings:'cv11','ss01','tnum';
+  letter-spacing:-0.005em;
+}
+code,kbd,.mono,.nbr .rel,.tag,.stat b,#feed .ft,#feed .fw{
+  font-family:'JetBrains Mono','SF Mono',Menlo,Consolas,monospace;
+  font-feature-settings:'tnum';
+  letter-spacing:0;
+}
+#bg{position:fixed;inset:0;z-index:0;
+  background-image:
+    linear-gradient(var(--line) 1px,transparent 1px),
+    linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:48px 48px;opacity:.25;
+  -webkit-mask-image:radial-gradient(ellipse 80% 70% at 50% 45%,#000,transparent);
+          mask-image:radial-gradient(ellipse 80% 70% at 50% 45%,#000,transparent);
+}
+#topbar{
+  position:fixed;top:0;left:0;right:0;height:48px;z-index:30;
+  display:flex;align-items:center;gap:14px;padding:0 18px;
+  background:rgba(0,0,0,.72);border-bottom:1px solid var(--line);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+}
+.brand{font-weight:600;letter-spacing:-0.015em;text-transform:none;
+  color:#fff;font-size:17px}
+.brand small{color:var(--dim);letter-spacing:0;text-transform:none;
+  margin-left:9px;font-size:13px;font-weight:500}
+#projwrap{position:relative}
+#projcaret{cursor:pointer;color:var(--dim);font-size:10px;padding:2px 5px}
+#projcaret:hover{color:var(--ink)}
+#projmenu,#actionsmenu{position:absolute;top:36px;min-width:240px;z-index:35;
+  background:rgba(28,28,30,.95);border:1px solid var(--line);border-radius:10px;
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 10px 30px rgba(0,0,0,.5);
+  padding:6px 0;display:none;font-size:12px}
+#projmenu{left:0;min-width:280px;font-size:11px}
+#actionsmenu{right:0}
+#actionswrap{position:relative}
+#projmenu.open,#actionsmenu.open{display:block}
+.amrow{display:flex;justify-content:space-between;align-items:center;
+  padding:7px 14px;cursor:pointer;color:var(--ink)}
+.amrow:hover{background:rgba(10,132,255,.15)}
+.amrow .amk{color:var(--faint);font-size:10px;
+  font-family:'JetBrains Mono','SF Mono',monospace;letter-spacing:.04em}
+.amsep{height:1px;background:var(--line);margin:5px 0}
+.projrow{padding:7px 14px;cursor:pointer;display:flex;
+  justify-content:space-between;gap:12px;align-items:center}
+.projrow:hover{background:rgba(10,132,255,.15)}
+.projrow.self{opacity:.55;font-weight:600}
+.projrow .pn{color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;flex:1}
+.projrow .ps{color:var(--faint);font-size:10px;flex:none}
+.projrow .pp{color:var(--dim);font-size:9px;width:100%;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.projmsg{padding:7px 14px;color:var(--dim);font-size:10px}
+.spacer{flex:1}
+.stat{color:var(--dim);font-size:11px}
+.stat b{color:var(--ink);font-weight:600}
+#search{
+  background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+  padding:6px 11px;border-radius:8px;width:200px;font:inherit;font-size:12px;
+}
+#search:focus{outline:none;border-color:var(--accent)}
+#searchopts{position:absolute;top:34px;left:0;z-index:35;
+  background:rgba(28,28,30,.95);border:1px solid var(--line);
+  border-radius:8px;padding:6px 10px;
+  display:none;flex-direction:column;gap:4px;font-size:11px;
+  color:var(--dim);min-width:140px;
+  backdrop-filter:blur(20px) saturate(180%)}
+#searchopts.open{display:flex}
+#searchopts label{cursor:pointer;display:flex;align-items:center;gap:6px}
+#searchopts input[type=checkbox]{accent-color:var(--accent)}
+#searchresults{position:absolute;top:34px;left:0;z-index:34;min-width:320px;
+  max-height:380px;overflow-y:auto;
+  background:rgba(28,28,30,.96);border:1px solid var(--line);
+  border-radius:8px;padding:4px 0;display:none;
+  backdrop-filter:blur(20px) saturate(180%);
+  box-shadow:0 10px 30px rgba(0,0,0,.5);font-size:12px}
+#searchresults.open{display:block}
+.srow{padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px}
+.srow:hover{background:rgba(10,132,255,.16)}
+.srow .sty{font-size:9px;color:var(--faint);letter-spacing:.06em;
+  text-transform:uppercase;min-width:64px}
+.srow .stitle{flex:1;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.srow .sproj{font-size:9px;color:var(--accent);letter-spacing:.04em;
+  text-transform:uppercase}
+.srow .slive{color:var(--task-done);font-size:8px}
+.btn{
+  background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+  padding:6px 12px;border-radius:8px;cursor:pointer;font:inherit;font-size:12px;
+  font-weight:500;letter-spacing:0;
+}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.go{background:var(--accent);color:#fff;border-color:var(--accent);
+  font-weight:600}
+.btn.go:hover{filter:brightness(1.1)}
+.live{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--task-done);
+  box-shadow:0 0 8px var(--task-done)}
+.dot.off{background:var(--faint);box-shadow:none}
+#legend{
+  position:fixed;left:14px;bottom:14px;z-index:20;display:flex;flex-wrap:wrap;
+  gap:5px;max-width:340px;
+}
+.chip{
+  display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:8px;
+  background:rgba(28,28,30,.82);border:1px solid var(--line);cursor:pointer;
+  font-size:11px;font-weight:500;letter-spacing:0;text-transform:none;
+  user-select:none;backdrop-filter:blur(20px);
+}
+.chip.off{opacity:.32}
+.chip i{width:9px;height:9px;border-radius:2px;display:block}
+canvas{position:fixed;inset:0;z-index:10}
+#panel{
+  position:fixed;top:48px;right:0;bottom:0;width:360px;z-index:25;
+  background:rgba(28,28,30,.92);border-left:1px solid var(--line);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  transform:translateX(100%);transition:transform .18s ease;
+  display:flex;flex-direction:column;
+}
+#treepanel{
+  position:fixed;top:48px;left:0;bottom:0;width:300px;z-index:24;
+  background:rgba(28,28,30,.92);border-right:1px solid var(--line);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  transform:translateX(-100%);transition:transform .18s ease;
+  display:flex;flex-direction:column;font-size:12px;
+}
+#treepanel.open{transform:translateX(0)}
+#treehead{padding:11px 14px;border-bottom:1px solid var(--line);
+  font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--dim);display:flex;justify-content:space-between;
+  align-items:center}
+#treesearch{margin:8px 10px 0;padding:5px 9px;border-radius:7px;
+  background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+  font:inherit;font-size:11px;width:calc(100% - 20px)}
+#treesearch:focus{outline:none;border-color:var(--accent)}
+#treebody{padding:6px 4px;overflow-y:auto;flex:1}
+.trow{padding:3px 8px 3px 4px;cursor:pointer;display:flex;
+  align-items:center;gap:5px;border-radius:5px;line-height:1.4;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trow:hover{background:rgba(10,132,255,.10)}
+.trow.sel{background:rgba(10,132,255,.18);color:#fff}
+.trow .tchev{display:inline-block;width:11px;color:var(--faint);
+  font-size:9px;text-align:center;user-select:none;cursor:pointer;flex:none}
+.trow .tchev:hover{color:var(--ink)}
+.trow .tdot{width:7px;height:7px;border-radius:50%;flex:none}
+.trow .ttitle{overflow:hidden;text-overflow:ellipsis}
+.trow .tcount{color:var(--faint);font-size:9px;flex:none;margin-left:auto}
+.trow .tmiss{color:var(--task-blocked);font-size:9px;flex:none;
+  letter-spacing:.04em;text-transform:uppercase;margin-left:6px}
+.trow .tpin{color:var(--question);font-size:10px;flex:none;margin-left:4px}
+.trow.archived{opacity:.45}
+.treetxt{cursor:pointer;color:var(--dim);text-transform:uppercase;
+  letter-spacing:.12em;font-weight:500;padding:2px 0}
+.treetxt:hover{color:var(--accent)}
+#panel.open{transform:translateX(0)}
+.phead{padding:14px 16px;border-bottom:1px solid var(--line)}
+.ptype{font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--dim);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ptype .gitbadge{
+  display:inline-flex;align-items:center;gap:4px;
+  background:rgba(255,159,10,.18);color:var(--milestone);
+  border:1px solid rgba(255,159,10,.35);
+  padding:1px 7px;border-radius:4px;font-size:9px;letter-spacing:.12em;
+  font-weight:700;font-family:'JetBrains Mono','SF Mono',monospace;
+}
+.ptitle{font-size:15px;margin-top:5px;line-height:1.35;color:#fff}
+.pbody{padding:14px 16px;overflow-y:auto;flex:1}
+.row{margin-bottom:14px}
+.lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:5px}
+.val{color:var(--ink);line-height:1.5;white-space:pre-wrap;word-break:break-word}
+textarea,select,.tin{
+  width:100%;background:var(--panel2);border:1px solid var(--line);
+  color:var(--ink);font:inherit;font-size:12px;padding:8px 10px;border-radius:8px;
+}
+textarea{resize:vertical;min-height:80px}
+textarea:focus,select:focus,.tin:focus{outline:none;border-color:var(--accent)}
+.nbr{
+  padding:6px 8px;border:1px solid var(--line);border-radius:4px;
+  margin-bottom:4px;cursor:pointer;font-size:11px;display:flex;gap:7px;
+  align-items:center;
+}
+.nbr:hover{border-color:var(--accent)}
+.nbr .rel{color:var(--accent);font-size:9px;letter-spacing:.08em;
+  text-transform:uppercase;min-width:64px}
+.pin{width:8px;height:8px;border-radius:2px;flex:none}
+.pfoot{padding:12px 16px;border-top:1px solid var(--line);display:flex;
+  gap:8px;flex-wrap:wrap}
+.x{cursor:pointer;color:var(--dim);font-size:18px;line-height:1}
+.x:hover{color:var(--accent)}
+#add,.overlay{
+  position:fixed;inset:0;z-index:40;background:rgba(0,0,0,.6);
+  backdrop-filter:blur(8px) saturate(140%);
+  -webkit-backdrop-filter:blur(8px) saturate(140%);
+  display:none;align-items:center;justify-content:center;
+}
+#add.open,.overlay.open{display:flex}
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  width:380px;padding:22px;
+  box-shadow:0 10px 40px rgba(0,0,0,.5);
+}
+.card h3{font-size:12px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:14px}
+.card .row{margin-bottom:11px}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);
+  padding:2px 7px;border-radius:3px;font-size:10px;margin:2px 3px 2px 0;
+  color:var(--dim)}
+.hint{position:fixed;bottom:14px;left:14px;z-index:20;color:var(--faint);
+  font-size:10px;line-height:1.7;pointer-events:none}
+.hint b{color:var(--dim)}
+#legend{bottom:54px}
+.muted{color:var(--faint)}
+/* empty state */
+#empty{
+  position:fixed;inset:46px 0 0 0;z-index:15;display:none;
+  align-items:center;justify-content:center;pointer-events:none;
+}
+#empty.show{display:flex}
+.ecard{
+  pointer-events:auto;max-width:430px;text-align:center;padding:36px 40px;
+  background:rgba(28,28,30,.78);border:1px solid var(--line);
+  border-radius:18px;backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 20px 60px rgba(0,0,0,.6);
+}
+.ek{font-size:13px;letter-spacing:.32em;text-transform:uppercase;
+  color:var(--accent);font-weight:700}
+.et{font-size:20px;color:#fff;margin:8px 0 16px;letter-spacing:.01em}
+.ecard p{color:var(--dim);line-height:1.6;font-size:12px;margin-bottom:10px}
+.erow{display:flex;flex-direction:column;gap:9px;align-items:center;
+  margin-top:18px}
+.erow code,.hcard code{background:var(--panel2);border:1px solid var(--line);
+  border-radius:3px;padding:1px 5px;color:var(--ink);font-size:11px}
+/* help */
+.hcard{width:440px}
+.hgrid{display:grid;grid-template-columns:auto 1fr;gap:7px 16px;
+  font-size:12px}
+.hgrid .k{color:var(--accent);text-align:right;white-space:nowrap}
+.hgrid .d{color:var(--dim)}
+kbd{background:var(--panel2);border:1px solid var(--line);
+  border-bottom-width:2px;border-radius:4px;padding:1px 6px;
+  font:inherit;font-size:11px;color:var(--ink)}
+#feedwrap{
+  position:fixed;right:14px;bottom:14px;z-index:22;width:300px;
+  background:rgba(28,28,30,.82);border:1px solid var(--line);
+  border-radius:12px;overflow:hidden;
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 8px 24px rgba(0,0,0,.4);
+}
+#feedhead{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:7px 11px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--dim);border-bottom:1px solid var(--line);cursor:pointer;
+  transition:background .3s;
+}
+#feedwrap.flash #feedhead{background:rgba(10,132,255,.18)}
+#feedtoggle{font-size:13px;color:var(--faint)}
+#feed{max-height:208px;overflow-y:auto;padding:4px 0}
+#feedwrap.min #feed{display:none}
+.frow{
+  display:flex;gap:7px;padding:4px 11px;font-size:11px;
+  border-left:2px solid transparent;animation:slidein .35s ease;
+  transition:background .15s;
+}
+.frow[data-nid]:hover{background:rgba(10,132,255,.10)}
+.frow.claude{border-left-color:var(--accent)}
+.frow .ft{color:var(--faint);font-size:10px;flex:none}
+.frow .fw{color:var(--dim);font-size:10px;flex:none;width:38px}
+.frow.claude .fw{color:var(--accent)}
+.frow .fx{color:var(--ink);word-break:break-word}
+@keyframes slidein{from{opacity:0;transform:translateX(12px)}
+  to{opacity:1;transform:translateX(0)}}
+#toast{
+  position:fixed;top:62px;left:50%;transform:translateX(-50%) translateY(-8px);
+  z-index:60;background:rgba(28,28,30,.95);border:1px solid var(--line);
+  border-radius:10px;padding:9px 16px;color:var(--ink);font-size:12px;
+  font-weight:500;letter-spacing:-0.005em;
+  box-shadow:0 8px 24px rgba(0,0,0,.5);
+  backdrop-filter:blur(20px) saturate(180%);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);
+  opacity:0;pointer-events:none;
+  transition:opacity .18s ease,transform .18s ease;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.ok{border-color:var(--task-done)}
+#toast.err{border-color:var(--task-blocked)}
+::-webkit-scrollbar{width:9px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
+</style>
+</head>
+<body>
+<div id="bg"></div>
+<canvas id="cv"></canvas>
+
+<div id="topbar">
+  <span class="brand" id="projwrap">weave<small id="proj"></small><span id="projcaret" title="other weave projects on this machine">&#9662;</span>
+    <div id="projmenu"></div>
+  </span>
+  <span class="stat" id="counts"></span>
+  <span class="stat" id="focusStat"></span>
+  <span class="spacer"></span>
+  <span id="searchwrap" style="position:relative">
+    <input id="search" placeholder="search  ( / )">
+    <div id="searchopts">
+      <label><input type="checkbox" id="searchDeep"> body+tags</label>
+      <label><input type="checkbox" id="searchGlobal"> all projects</label>
+    </div>
+    <div id="searchresults"></div>
+  </span>
+  <button class="btn" id="treeBtn" title="folder tree (t)">tree</button>
+  <button class="btn" id="fit" title="zoom to fit (z)">fit</button>
+  <span id="actionswrap">
+    <button class="btn" id="actionsBtn" title="actions">&middot;&middot;&middot;</button>
+    <div id="actionsmenu">
+      <div class="amrow" data-act="undo">
+        <span class="amlbl">Undo last change</span><span class="amk">U</span>
+      </div>
+      <div class="amrow" data-act="history">
+        <span class="amlbl">History...</span><span class="amk"></span>
+      </div>
+      <div class="amrow" data-act="sync">
+        <span class="amlbl">Sync (refresh files)</span><span class="amk"></span>
+      </div>
+      <div class="amrow" data-act="scan">
+        <span class="amlbl">Sync &mdash; full scan</span><span class="amk"></span>
+      </div>
+      <div class="amrow" data-act="prune">
+        <span class="amlbl">Sync &mdash; prune missing</span><span class="amk"></span>
+      </div>
+      <div class="amrow" data-act="commit">
+        <span class="amlbl">Link git commit...</span><span class="amk"></span>
+      </div>
+      <div class="amsep"></div>
+      <div class="amrow" data-act="relayout">
+        <span class="amlbl">Re-run layout</span><span class="amk">R</span>
+      </div>
+    </div>
+  </span>
+  <button class="btn go" id="addBtn" title="add node (n)">+ add</button>
+  <button class="btn" id="helpBtn" title="shortcuts (?)">?</button>
+  <span class="live"><span class="dot off" id="livedot"></span>
+    <span id="livetxt">static</span></span>
+</div>
+
+<div id="legend"></div>
+<div class="hint" id="hint">drag node &middot; scroll zoom &middot; drag bg pan
+  &middot; shift-drag node&rarr;node to link<br>
+  click node for details &middot; press <b>?</b> for shortcuts</div>
+
+<div id="empty">
+  <div class="ecard">
+    <div class="ek">weave</div>
+    <div class="et">the shared project mind</div>
+    <p>This canvas is the graph Claude and you both edit &mdash; plans,
+       tasks, decisions, files, questions.</p>
+    <p>Nothing here yet. Add your first node, or seed an example to explore.</p>
+    <div class="erow">
+      <button class="btn go" id="emptyAdd">+ add a node</button>
+      <span class="muted" id="emptyDemo">or run
+        <code>weave demo</code> in your terminal</span>
+    </div>
+  </div>
+</div>
+
+<div id="treepanel">
+  <div id="treehead"><span>folder tree</span>
+    <span style="display:flex;gap:10px;align-items:center;font-size:9px;letter-spacing:.04em">
+      <span id="treeExpand" class="treetxt" title="expand all folders">expand</span>
+      <span id="treeCollapse" class="treetxt" title="collapse all folders">collapse</span>
+      <span class="x" id="treeClose">&times;</span>
+    </span>
+  </div>
+  <input id="treesearch" placeholder="filter by name...">
+  <div id="treebody"></div>
+</div>
+
+<div id="toast"></div>
+
+<div id="history" class="overlay">
+  <div class="card hcard">
+    <h3>history &mdash; rolling snapshots</h3>
+    <p class="muted" style="font-size:11px;margin-bottom:10px">
+      Each save writes a snapshot. Click a row to restore that revision
+      (the restore itself becomes a new snapshot, so undo is reversible).</p>
+    <div id="histlist" style="max-height:340px;overflow-y:auto;
+      border:1px solid var(--line);border-radius:7px"></div>
+    <div class="pfoot" style="padding:0;border:0;margin-top:10px">
+      <button class="btn" id="histClose">close</button>
+    </div>
+  </div>
+</div>
+
+<div id="commit" class="overlay">
+  <div class="card">
+    <h3>link git commit(s)</h3>
+    <p class="muted" style="font-size:11px;margin-bottom:10px">
+      Creates a milestone node per commit, with <code>produces</code>
+      edges to any tracked files the commit touched.</p>
+    <div class="row"><div class="lbl">commit ref (default HEAD)</div>
+      <input class="tin" id="cSha" placeholder="HEAD, abc123, branch-name..."></div>
+    <div class="row"><div class="lbl">OR &mdash; --since &lt;ref&gt; (links every commit in &lt;ref&gt;..HEAD)</div>
+      <input class="tin" id="cSince" placeholder="HEAD~5, v1.0, main..."></div>
+    <div class="pfoot" style="padding:0;border:0;margin-top:6px">
+      <button class="btn go" id="cGo">link</button>
+      <button class="btn" id="cCancel">cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="feedwrap">
+  <div id="feedhead"><span>activity</span>
+    <span id="feedtoggle">&minus;</span></div>
+  <div id="feed"></div>
+</div>
+
+<div id="help" class="overlay">
+  <div class="card hcard">
+    <h3>keyboard &amp; gestures</h3>
+    <div class="hgrid" id="hgrid"></div>
+    <div class="pfoot" style="padding:0;border:0;margin-top:10px">
+      <button class="btn" id="helpClose">close</button>
+    </div>
+  </div>
+</div>
+
+<div id="panel">
+  <div class="phead">
+    <div style="display:flex;justify-content:space-between;align-items:start">
+      <div><div class="ptype" id="pType"></div>
+        <div class="ptitle" id="pTitle"></div></div>
+      <span class="x" id="pClose">&times;</span>
+    </div>
+  </div>
+  <div class="pbody" id="pBody"></div>
+  <div class="pfoot" id="pFoot"></div>
+</div>
+
+<div id="add">
+  <div class="card">
+    <h3>new node</h3>
+    <div class="row"><div class="lbl">type</div>
+      <select id="aType"></select></div>
+    <div class="row"><div class="lbl">title</div>
+      <input class="tin" id="aTitle" placeholder="short title"></div>
+    <div class="row"><div class="lbl">body / notes</div>
+      <textarea id="aBody" placeholder="detail for Claude..."></textarea></div>
+    <div class="row"><div class="lbl">link to (optional)</div>
+      <select id="aParent"></select></div>
+    <div class="pfoot" style="padding:0;border:0;margin-top:6px">
+      <button class="btn go" id="aSave">create</button>
+      <button class="btn" id="aCancel">cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="link" class="overlay">
+  <div class="card">
+    <h3>link nodes</h3>
+    <div class="row">
+      <span class="muted" id="lFrom"></span>
+      <span style="color:var(--accent)"> &mdash;&rarr; </span>
+      <span class="muted" id="lTo"></span>
+    </div>
+    <div class="row"><div class="lbl">relationship</div>
+      <select id="lRel"></select></div>
+    <div class="pfoot" style="padding:0;border:0;margin-top:6px">
+      <button class="btn go" id="lSave">create link</button>
+      <button class="btn" id="lCancel">cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const MODE = "__WEAVE_MODE__";
+const BOOT = __WEAVE_DATA__;
+const TYPES = ["plan","task","decision","file","folder","note","question",
+  "milestone"];
+const RELS = ["implements","depends_on","blocks","relates_to","supersedes",
+  "produces","contains","answers","reads"];
+
+function typeColor(n){
+  if(n.type==="task"){
+    return {todo:"--task-todo",doing:"--task-doing",done:"--task-done",
+      blocked:"--task-blocked"}[n.status||"todo"]||"--task-todo";
+  }
+  return {plan:"--plan",file:"--file",folder:"--folder",
+    decision:"--decision",note:"--note",
+    question:"--question",milestone:"--milestone"}[n.type]||"--dim";
+}
+function cssVar(v){
+  return getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+}
+
+let graph={meta:{},nodes:{},edges:[],log:[]};
+let focusId=null;
+const pos=new Map();          // id -> {x,y,vx,vy,fixed}
+const hidden=new Set(["archive"]);   // archived nodes hidden by default
+let selected=null, hover=null, search="";
+let cam={x:0,y:0,s:1}, alpha=1;
+const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
+let drag=null, panning=null;
+
+function resize(){
+  cv.width=innerWidth*devicePixelRatio;
+  cv.height=innerHeight*devicePixelRatio;
+  cv.style.width=innerWidth+"px"; cv.style.height=innerHeight+"px";
+}
+addEventListener("resize",resize); resize();
+
+let didFit=false;
+let prevNodeCount=0;
+function ingest(g){
+  graph=g; focusId=g.focus||null;
+  const ids=Object.keys(g.nodes);
+  const R=Math.max(160,ids.length*14);
+  ids.forEach((id,i)=>{
+    if(!pos.has(id)){
+      const a=i*2.399963;
+      pos.set(id,{x:Math.cos(a)*R*Math.sqrt(i/ids.length+.05),
+        y:Math.sin(a)*R*Math.sqrt(i/ids.length+.05),vx:0,vy:0,fixed:false});
+    }
+  });
+  for(const id of [...pos.keys()]) if(!g.nodes[id]) pos.delete(id);
+  alpha=Math.max(alpha,.7);
+  renderChrome();
+  document.getElementById("empty").classList.toggle("show",ids.length===0);
+  if(selected && !g.nodes[selected]){selected=null;closePanel();}
+  else if(selected) openPanel(selected);
+  if(!didFit && ids.length){didFit=true;setTimeout(fitView,650);}
+  // Big shrink (undo / prune / massive delete): re-fit so the human isn't
+  // left staring at empty canvas where the graph used to extend.
+  else if(prevNodeCount > 20 && ids.length < prevNodeCount * 0.6){
+    setTimeout(fitView,300);
+  }
+  prevNodeCount=ids.length;
+}
+
+function isHidden(n){
+  if(!n)return true;
+  if(hidden.has(n.type))return true;
+  if((n.tier||"active")==="archive" && hidden.has("archive"))return true;
+  return false;
+}
+function fitView(){
+  const vis=[...pos.entries()].filter(
+    ([id])=>graph.nodes[id]&&!isHidden(graph.nodes[id]));
+  if(!vis.length)return;
+  let minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;
+  for(const [id,p] of vis){
+    const r=nodeRadius(id)+18;
+    minx=Math.min(minx,p.x-r); maxx=Math.max(maxx,p.x+r);
+    miny=Math.min(miny,p.y-r); maxy=Math.max(maxy,p.y+r);
+  }
+  const w=maxx-minx,h=maxy-miny;
+  const s=Math.min(2.4,Math.max(.2,
+    Math.min((innerWidth-380)/w,(innerHeight-150)/h)));
+  cam.s=s;
+  cam.x=-((minx+maxx)/2)*s;
+  cam.y=-((miny+maxy)/2)*s;
+}
+
+// ---- layout ----
+function step(){
+  if(alpha<.005){requestAnimationFrame(step);draw();return;}
+  const ids=[...pos.keys()];
+  const visible=ids.filter(id=>!isHidden(graph.nodes[id]));
+  for(let i=0;i<visible.length;i++){
+    const a=pos.get(visible[i]);
+    for(let j=i+1;j<visible.length;j++){
+      const b=pos.get(visible[j]);
+      let dx=a.x-b.x,dy=a.y-b.y,d2=dx*dx+dy*dy||1;
+      const f=2600/d2;
+      const d=Math.sqrt(d2);
+      a.vx+=dx/d*f; a.vy+=dy/d*f; b.vx-=dx/d*f; b.vy-=dy/d*f;
+    }
+  }
+  for(const e of graph.edges){
+    const a=pos.get(e.from),b=pos.get(e.to);
+    if(!a||!b)continue;
+    let dx=b.x-a.x,dy=b.y-a.y,d=Math.sqrt(dx*dx+dy*dy)||1;
+    // contains edges (folder->child) want tight nesting so the filesystem
+    // shape reads as fans, not as long chains. Other edges keep the wider
+    // relationship-graph layout.
+    const tight=e.rel==="contains";
+    const target=tight?42:118;
+    const k=tight?0.075:0.022;
+    const f=(d-target)*k;
+    a.vx+=dx/d*f; a.vy+=dy/d*f; b.vx-=dx/d*f; b.vy-=dy/d*f;
+  }
+  for(const id of ids){
+    const p=pos.get(id);
+    p.vx-=p.x*0.0045; p.vy-=p.y*0.0045;          // gravity to center
+    if(p.fixed){p.vx=0;p.vy=0;continue;}
+    p.vx*=0.86; p.vy*=0.86;
+    p.x+=p.vx*alpha; p.y+=p.vy*alpha;
+  }
+  alpha*=0.985;
+  draw();
+  requestAnimationFrame(step);
+}
+
+function nodeRadius(id){
+  const n=graph.nodes[id];
+  let r=7+Math.min(degree(id),10)*1.1;
+  if(n.type==="plan"||n.type==="milestone")r+=4;
+  return r;
+}
+function degree(id){
+  let d=0; for(const e of graph.edges)
+    if(e.from===id||e.to===id)d++;
+  return d;
+}
+
+function draw(){
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  ctx.clearRect(0,0,innerWidth,innerHeight);
+  ctx.save();
+  ctx.translate(innerWidth/2+cam.x,innerHeight/2+cam.y);
+  ctx.scale(cam.s,cam.s);
+
+  // edges
+  for(const e of graph.edges){
+    const a=pos.get(e.from),b=pos.get(e.to);
+    if(!a||!b)continue;
+    const na=graph.nodes[e.from],nb=graph.nodes[e.to];
+    if(isHidden(na)||isHidden(nb))continue;
+    const hl=selected&&(e.from===selected||e.to===selected);
+    const isRead=e.rel==="reads";
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y);
+    ctx.strokeStyle=hl?cssVar("--accent")
+      :isRead?cssVar("--file"):cssVar("--line");
+    ctx.globalAlpha=hl?.9:isRead?.5:.55;
+    ctx.lineWidth=(hl?1.6:1)/cam.s;
+    if(e.rel==="depends_on"||e.rel==="blocks")ctx.setLineDash([4/cam.s,3/cam.s]);
+    else if(isRead)ctx.setLineDash([1/cam.s,3/cam.s]);
+    ctx.stroke(); ctx.setLineDash([]);
+    if(hl){
+      const mx=(a.x+b.x)/2,my=(a.y+b.y)/2;
+      ctx.globalAlpha=1; ctx.fillStyle=cssVar("--accent");
+      ctx.font="500 "+(9/cam.s)+"px Inter,-apple-system,sans-serif";
+      ctx.textAlign="center"; ctx.fillText(e.rel,mx,my-3/cam.s);
+    }
+  }
+  ctx.globalAlpha=1;
+
+  // nodes
+  for(const [id,p] of pos){
+    const n=graph.nodes[id]; if(!n||hidden.has(n.type))continue;
+    const tier=n.tier||"active";
+    if(tier==="archive" && hidden.has("archive"))continue;
+    const r=nodeRadius(id);
+    const col=cssVar(typeColor(n));
+    const isSel=id===selected, isHov=id===hover;
+    const match=search&&n.title.toLowerCase().includes(search);
+    const dim=search&&!match;
+    const archDim=(tier==="archive")?0.32:1;
+    ctx.globalAlpha=(dim?.2:1)*archDim;
+
+    if(tier==="pinned"){
+      ctx.beginPath(); ctx.arc(p.x,p.y,r+4,0,7);
+      ctx.strokeStyle=cssVar("--question"); ctx.lineWidth=1.6/cam.s;
+      ctx.stroke();
+    }
+    if(id===focusId){
+      ctx.beginPath(); ctx.arc(p.x,p.y,r+5,0,7);
+      ctx.strokeStyle=cssVar("--accent"); ctx.lineWidth=1.4/cam.s;
+      ctx.setLineDash([2/cam.s,2/cam.s]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    // pop-in: expanding ring when a node first appears
+    if(popIds.has(id)){
+      const age=performance.now()-(popClock.get(id)||0);
+      if(age>1600){popIds.delete(id);popClock.delete(id);}
+      else{
+        const k=age/1600;
+        ctx.beginPath();
+        ctx.arc(p.x,p.y,r+3+k*26/cam.s,0,7);
+        ctx.strokeStyle=cssVar("--accent");
+        ctx.globalAlpha=(1-k)*0.7;
+        ctx.lineWidth=2/cam.s; ctx.stroke();
+        ctx.globalAlpha=dim?.2:1;
+        alpha=Math.max(alpha,.06);
+      }
+    }
+    if(isSel||isHov){
+      ctx.beginPath(); ctx.arc(p.x,p.y,r+3.5,0,7);
+      ctx.fillStyle=col; ctx.globalAlpha=dim?.2:.28; ctx.fill();
+      ctx.globalAlpha=dim?.2:1;
+    }
+    ctx.beginPath(); ctx.arc(p.x,p.y,r,0,7);
+    ctx.fillStyle=col; ctx.fill();
+    if(n.type==="milestone"||n.type==="plan"){
+      ctx.lineWidth=2/cam.s; ctx.strokeStyle=cssVar("--bg"); ctx.stroke();
+    }
+    // git-commit milestones get a dashed outer ring so they read as
+    // "external/historical" rather than ordinary plan milestones.
+    if(n.type==="milestone" && (n.tags||[]).indexOf("git")>=0){
+      ctx.beginPath(); ctx.arc(p.x,p.y,r+3,0,7);
+      ctx.strokeStyle=cssVar("--milestone");
+      const prev=ctx.globalAlpha; ctx.globalAlpha=prev*0.6;
+      ctx.lineWidth=1.2/cam.s;
+      ctx.setLineDash([2/cam.s,2/cam.s]); ctx.stroke();
+      ctx.setLineDash([]); ctx.globalAlpha=prev;
+    }
+    if(n.missing){
+      ctx.strokeStyle=cssVar("--task-blocked"); ctx.lineWidth=2/cam.s;
+      ctx.stroke();
+    }
+    if(cam.s>0.55||isSel||isHov||match){
+      ctx.fillStyle=isSel?"#fff":cssVar("--ink");
+      ctx.globalAlpha=dim?.25:1;
+      ctx.font=(isSel?"600 ":"500 ")+((isSel?11:10)/cam.s)+
+        "px Inter,-apple-system,sans-serif";
+      ctx.textAlign="center";
+      const t=n.title.length>26?n.title.slice(0,25)+"\u2026":n.title;
+      ctx.fillText(t,p.x,p.y+r+11/cam.s);
+    }
+  }
+  ctx.globalAlpha=1;
+
+  // shift-drag link ghost
+  if(linking){
+    const a=pos.get(linking.from);
+    if(a){
+      const w=screenToWorld(linking.x,linking.y);
+      ctx.beginPath(); ctx.moveTo(a.x,a.y);
+      ctx.lineTo(w.x,w.y);
+      ctx.strokeStyle=cssVar("--accent");
+      ctx.globalAlpha=.85; ctx.lineWidth=1.6/cam.s;
+      ctx.setLineDash([5/cam.s,4/cam.s]); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(w.x,w.y,3/cam.s,0,7);
+      ctx.fillStyle=cssVar("--accent"); ctx.fill();
+      ctx.globalAlpha=1;
+    }
+  }
+  ctx.restore();
+}
+
+// ---- hit testing ----
+function screenToWorld(sx,sy){
+  return {x:(sx-innerWidth/2-cam.x)/cam.s,y:(sy-innerHeight/2-cam.y)/cam.s};
+}
+function pick(sx,sy){
+  const w=screenToWorld(sx,sy);
+  let best=null,bd=1e9;
+  for(const [id,p] of pos){
+    const n=graph.nodes[id]; if(!n||isHidden(n))continue;
+    const r=nodeRadius(id)+4;
+    const d=(p.x-w.x)**2+(p.y-w.y)**2;
+    if(d<r*r&&d<bd){bd=d;best=id;}
+  }
+  return best;
+}
+
+let linking=null;          // shift-drag to create an edge
+cv.addEventListener("mousedown",e=>{
+  const id=pick(e.clientX,e.clientY);
+  if(id && e.shiftKey){
+    linking={from:id,x:e.clientX,y:e.clientY};
+    cv.style.cursor="crosshair";
+  }else if(id){
+    const p=pos.get(id);
+    drag={id,p,fixedWas:p.fixed,moved:false};
+    p.fixed=true;
+  }else{
+    panning={x:e.clientX,y:e.clientY,cx:cam.x,cy:cam.y};
+  }
+});
+addEventListener("mousemove",e=>{
+  if(linking){
+    linking.x=e.clientX; linking.y=e.clientY;
+    linking.over=pick(e.clientX,e.clientY);
+  }else if(drag){
+    const w=screenToWorld(e.clientX,e.clientY);
+    drag.p.x=w.x; drag.p.y=w.y; drag.p.vx=0; drag.p.vy=0;
+    drag.moved=true; alpha=Math.max(alpha,.3);
+  }else if(panning){
+    cam.x=panning.cx+(e.clientX-panning.x);
+    cam.y=panning.cy+(e.clientY-panning.y);
+  }else{
+    const id=pick(e.clientX,e.clientY);
+    hover=id;
+    cv.style.cursor=id?(e.shiftKey?"crosshair":"pointer"):"default";
+  }
+});
+addEventListener("mouseup",e=>{
+  if(linking){
+    const to=pick(e.clientX,e.clientY);
+    if(to && to!==linking.from){ openLink(linking.from,to); }
+    linking=null; cv.style.cursor="default";
+  }else if(drag){
+    if(!drag.moved){ selected=drag.id; openPanel(drag.id); }
+    drag.p.fixed=drag.moved?true:drag.fixedWas;
+    drag=null;
+  }
+  panning=null;
+});
+cv.addEventListener("dblclick",e=>{
+  if(MODE!=="live")return;
+  if(!pick(e.clientX,e.clientY))openAdd();
+});
+cv.addEventListener("wheel",e=>{
+  e.preventDefault();
+  const k=e.deltaY<0?1.12:0.89;
+  const mx=e.clientX-innerWidth/2,my=e.clientY-innerHeight/2;
+  cam.x=mx-(mx-cam.x)*k; cam.y=my-(my-cam.y)*k;
+  cam.s=Math.min(3.5,Math.max(0.15,cam.s*k));
+},{passive:false});
+
+// ---- chrome ----
+function renderChrome(){
+  document.getElementById("proj").textContent=graph.meta.project||"";
+  const ns=Object.values(graph.nodes);
+  const tasks=ns.filter(n=>n.type==="task");
+  const done=tasks.filter(n=>n.status==="done").length;
+  document.getElementById("counts").innerHTML=
+    "<b>"+ns.length+"</b> nodes &middot; <b>"+graph.edges.length+
+    "</b> edges &middot; tasks <b>"+done+"/"+tasks.length+"</b>";
+  const fs=document.getElementById("focusStat");
+  if(focusId&&graph.nodes[focusId])
+    fs.innerHTML="focus: <b>"+esc(graph.nodes[focusId].title)+"</b>";
+  else fs.textContent="";
+
+  const leg=document.getElementById("legend"); leg.innerHTML="";
+  const items=[["plan","--plan"],["task","--task-doing"],["file","--file"],
+    ["folder","--folder"],["decision","--decision"],["note","--note"],
+    ["question","--question"],["milestone","--milestone"]];
+  for(const [t,v] of items){
+    const c=document.createElement("div");
+    c.className="chip"+(hidden.has(t)?" off":"");
+    c.innerHTML="<i style='background:"+cssVar(v)+"'></i>"+t;
+    c.onclick=()=>{hidden.has(t)?hidden.delete(t):hidden.add(t);
+      renderChrome();alpha=Math.max(alpha,.4);};
+    leg.appendChild(c);
+  }
+  // tier toggle: only show if there are any archived nodes
+  const anyArch=Object.values(graph.nodes).some(
+    n=>(n.tier||"active")==="archive");
+  if(anyArch){
+    const c=document.createElement("div");
+    c.className="chip"+(hidden.has("archive")?" off":"")+
+      " tierchip";
+    c.innerHTML="<i style='background:var(--faint)'></i>archive";
+    c.title="show / hide archived nodes";
+    c.onclick=()=>{
+      hidden.has("archive")?hidden.delete("archive"):hidden.add("archive");
+      renderChrome();alpha=Math.max(alpha,.4);};
+    leg.appendChild(c);
+  }
+  if(document.getElementById("treepanel").classList.contains("open"))
+    renderTree();
+}
+function esc(s){return (s||"").replace(/[&<>]/g,c=>(
+  {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+
+let _toastTimer=null;
+function toast(msg,kind,duration){
+  // duration: ms before auto-dismiss; 0 = sticky (until another toast() call
+  // replaces it or dismissToast()). Default 2200ms.
+  const t=document.getElementById("toast"); if(!t)return;
+  t.textContent=msg;
+  t.className=""+(kind||"");
+  void t.offsetWidth;
+  t.classList.add("show");
+  clearTimeout(_toastTimer);
+  if(duration !== 0){
+    _toastTimer=setTimeout(()=>t.classList.remove("show"),
+      duration || 2200);
+  }
+}
+function dismissToast(){
+  const t=document.getElementById("toast"); if(!t)return;
+  clearTimeout(_toastTimer);
+  t.classList.remove("show");
+}
+
+// ---- tree panel ----
+const treeCollapsed=new Set();       // folder ids the user has collapsed
+let treeAutoCollapsed=false;          // first-render auto-collapse pass
+let treeSearch="";
+
+function renderTree(){
+  const body=document.getElementById("treebody"); body.innerHTML="";
+  const parentOf={}, childrenOf={};
+  for(const e of graph.edges){
+    if(e.rel==="contains"){
+      parentOf[e.to]=e.from;
+      (childrenOf[e.from]=childrenOf[e.from]||[]).push(e.to);
+    }
+  }
+  const roots=[];
+  for(const id in graph.nodes){
+    const n=graph.nodes[id];
+    if((n.type==="folder"||n.type==="file") && !parentOf[id])
+      roots.push(id);
+  }
+  const cmp=(a,b)=>{
+    const na=graph.nodes[a],nb=graph.nodes[b];
+    if((na.type==="folder")!==(nb.type==="folder"))
+      return na.type==="folder"?-1:1;
+    return (na.title||"").localeCompare(nb.title||"");
+  };
+  roots.sort(cmp);
+
+  // first-time: collapse folders that would dump a lot into the panel.
+  // Keep top-level expanded; below that, collapse only folders whose
+  // subtree exceeds AUTOCOLLAPSE_THRESHOLD. Shallow projects show
+  // fully; deep dense ones stay manageable.
+  if(!treeAutoCollapsed){
+    treeAutoCollapsed=true;
+    const AUTOCOLLAPSE_THRESHOLD=12;
+    function descCount(id,memo){
+      if(memo.has(id))return memo.get(id);
+      let n=0;
+      for(const k of (childrenOf[id]||[])){n++;n+=descCount(k,memo);}
+      memo.set(id,n); return n;
+    }
+    const memo=new Map();
+    for(const id in graph.nodes){
+      const n=graph.nodes[id];
+      if(n.type==="folder" && parentOf[id] &&
+         descCount(id,memo) > AUTOCOLLAPSE_THRESHOLD){
+        treeCollapsed.add(id);
+      }
+    }
+  }
+
+  // search: if active, find matches and force-expand their ancestor path
+  let forceShow=null;
+  if(treeSearch){
+    const q=treeSearch.toLowerCase();
+    forceShow=new Set();
+    for(const id in graph.nodes){
+      const n=graph.nodes[id];
+      if((n.type==="folder"||n.type==="file") &&
+         (n.title||"").toLowerCase().includes(q)){
+        let cur=id;
+        while(cur){
+          forceShow.add(cur);
+          if(treeCollapsed.has(cur)) treeCollapsed.delete(cur);
+          cur=parentOf[cur];
+        }
+      }
+    }
+  }
+
+  function countDescendants(id){
+    let n=0;
+    for(const k of (childrenOf[id]||[])){
+      n++; n+=countDescendants(k);
+    }
+    return n;
+  }
+
+  function row(id,depth){
+    const n=graph.nodes[id]; if(!n)return;
+    if(forceShow && !forceShow.has(id))return;
+    const tier=n.tier||"active";
+    if(tier==="archive" && hidden.has("archive"))return;
+    const r=document.createElement("div");
+    r.className="trow"+(selected===id?" sel":"")+
+      (tier==="archive"?" archived":"");
+    r.style.paddingLeft=(4+depth*14)+"px";
+
+    const chev=document.createElement("span");
+    chev.className="tchev";
+    const kids=childrenOf[id]||[];
+    if(n.type==="folder" && kids.length){
+      chev.textContent=treeCollapsed.has(id)?"▸":"▾";
+      chev.onclick=ev=>{
+        ev.stopPropagation();
+        treeCollapsed.has(id)?treeCollapsed.delete(id):treeCollapsed.add(id);
+        renderTree();
+      };
+    }else{ chev.textContent=""; }
+    r.appendChild(chev);
+
+    const dot=document.createElement("span");
+    dot.className="tdot";
+    dot.style.background=cssVar(typeColor(n));
+    r.appendChild(dot);
+
+    const t=document.createElement("span");
+    t.className="ttitle";
+    t.textContent=(n.type==="folder"?(n.title||"/"):n.title);
+    r.appendChild(t);
+
+    if(tier==="pinned"){
+      const p=document.createElement("span");
+      p.className="tpin"; p.textContent="★"; p.title="pinned";
+      r.appendChild(p);
+    }
+    if(n.missing){
+      const m=document.createElement("span");
+      m.className="tmiss"; m.textContent="missing";
+      r.appendChild(m);
+    }
+    if(n.type==="folder" && treeCollapsed.has(id) && kids.length){
+      const c=document.createElement("span");
+      c.className="tcount"; c.textContent=countDescendants(id);
+      r.appendChild(c);
+    }
+
+    r.onclick=()=>{
+      selected=id; openPanel(id); centerOn(id);
+      cam.s=Math.max(cam.s,.9);
+      renderTree();
+    };
+    body.appendChild(r);
+    if(!treeCollapsed.has(id)){
+      for(const k of kids.slice().sort(cmp)) row(k,depth+1);
+    }
+  }
+  if(!roots.length){
+    body.innerHTML="<div style='padding:14px 16px;color:var(--dim);"+
+      "font-size:11px;line-height:1.5'>No folder/file nodes yet. "+
+      "Run <code style='background:var(--panel2);padding:1px 5px;"+
+      "border-radius:3px'>weave sync --scan</code> in your terminal "+
+      "to import the project tree.</div>";
+    return;
+  }
+  for(const id of roots) row(id,0);
+}
+function toggleTree(){
+  const tp=document.getElementById("treepanel");
+  tp.classList.toggle("open");
+  if(tp.classList.contains("open")) renderTree();
+}
+
+// ---- detail panel ----
+function openPanel(id){
+  const n=graph.nodes[id]; if(!n)return;
+  document.getElementById("panel").classList.add("open");
+  const gitTag=(n.type==="milestone" && (n.tags||[]).indexOf("git")>=0);
+  const pType=document.getElementById("pType");
+  pType.innerHTML="";
+  if(gitTag){
+    const b=document.createElement("span");
+    b.className="gitbadge";
+    // short SHA from the tags array (set by `weave commit`)
+    const sha=(n.tags||[]).find(t=>t!=="git"&&t.length>=7&&/^[0-9a-f]+$/.test(t));
+    b.textContent="git"+(sha?"  "+sha.slice(0,7):"");
+    pType.appendChild(b);
+  }
+  const label=document.createTextNode(
+    (gitTag?"milestone":n.type)+(n.author?"  \u00b7  by "+n.author:""));
+  pType.appendChild(label);
+  document.getElementById("pTitle").textContent=n.title;
+  const b=document.getElementById("pBody"); b.innerHTML="";
+  const live=MODE==="live";
+
+  if(n.type==="task"||n.type==="question"){
+    const opts=n.type==="task"
+      ?["todo","doing","done","blocked"]:["open","resolved"];
+    b.appendChild(field("status",
+      live?selectEl(opts,n.status,v=>op({op:"update_node",id,status:v}))
+          :textEl(n.status||"-")));
+  }
+  if(n.path) b.appendChild(field("path",textEl(n.path)));
+  if(n.tags&&n.tags.length){
+    const d=document.createElement("div");
+    d.innerHTML=n.tags.map(t=>"<span class='tag'>"+esc(t)+"</span>").join("");
+    b.appendChild(field("tags",d));
+  }
+  // memory tier (pin / archive)
+  if(live){
+    const tierSel=selectEl(["active","pinned","archive"],
+      n.tier||"active",
+      v=>op({op:"update_node",id,tier:v}));
+    b.appendChild(field("memory tier",tierSel));
+  }else if((n.tier||"active")!=="active"){
+    b.appendChild(field("memory tier",textEl(n.tier)));
+  }
+  // body
+  if(live){
+    const ta=document.createElement("textarea"); ta.value=n.body||"";
+    ta.onblur=()=>{ if(ta.value!==(n.body||""))
+      op({op:"update_node",id,body:ta.value}); };
+    b.appendChild(field("body / notes",ta));
+  }else{
+    b.appendChild(field("body",textEl(n.body||"\u2014")));
+  }
+  b.appendChild(field("updated",textEl(n.updated||"")));
+
+  // neighbors
+  const out=graph.edges.filter(e=>e.from===id);
+  const inc=graph.edges.filter(e=>e.to===id);
+  if(out.length||inc.length){
+    const wrap=document.createElement("div");
+    out.forEach(e=>wrap.appendChild(nbrEl(e.rel+" \u2192",e.to)));
+    inc.forEach(e=>wrap.appendChild(nbrEl("\u2190 "+e.rel,e.from)));
+    b.appendChild(field("connections",wrap));
+  }
+
+  // context routing: reading list for plan/task/milestone
+  if(["plan","task","milestone"].includes(n.type)){
+    const rl=readingList(id);
+    const wrap=document.createElement("div");
+    if(rl.length){
+      rl.forEach(r=>{
+        const row=document.createElement("div"); row.className="nbr";
+        row.innerHTML="<span class='pin' style='background:"+
+          cssVar("--file")+"'></span><span style='flex:1'>"+
+          esc(r.path)+"</span>";
+        if(live&&r.direct){
+          const x=document.createElement("span");
+          x.textContent="\u00d7"; x.style.cssText=
+            "color:var(--dim);cursor:pointer;padding:0 3px";
+          x.title="detach"; x.onclick=ev=>{ev.stopPropagation();
+            op({op:"del_edge",from:id,to:r.tid,rel:"reads"});};
+          row.appendChild(x);
+        }else if(!r.direct){
+          const tag=document.createElement("span");
+          tag.className="muted"; tag.style.fontSize="9px";
+          tag.textContent="inherited"; row.appendChild(tag);
+        }
+        wrap.appendChild(row);
+      });
+    }else{
+      const e=document.createElement("div"); e.className="muted";
+      e.style.fontSize="11px";
+      e.textContent="no reading list \u2014 attach files Claude should load";
+      wrap.appendChild(e);
+    }
+    if(live){
+      const sel=document.createElement("select");
+      sel.style.marginTop="6px";
+      const ph=document.createElement("option");
+      ph.value=""; ph.textContent="+ attach file / folder...";
+      sel.appendChild(ph);
+      const attached=new Set(graph.edges.filter(
+        e=>e.from===id&&e.rel==="reads").map(e=>e.to));
+      Object.values(graph.nodes)
+        .filter(x=>(x.type==="file"||x.type==="folder")&&!attached.has(x.id))
+        .sort((a,b)=>(a.path||a.title).localeCompare(b.path||b.title))
+        .forEach(x=>{const o=document.createElement("option");
+          o.value=x.id;o.textContent=(x.type==="folder"?"\ud83d\udcc1 ":"")+
+            (x.path||x.title);sel.appendChild(o);});
+      sel.onchange=()=>{ if(sel.value)
+        op({op:"add_edge",from:id,to:sel.value,rel:"reads"}); };
+      wrap.appendChild(sel);
+    }
+    b.appendChild(field("reading list \u00b7 what Claude loads",wrap));
+  }
+
+  const foot=document.getElementById("pFoot"); foot.innerHTML="";
+  if(live){
+    const f=document.createElement("button"); f.className="btn";
+    f.textContent=(focusId===id)?"unfocus":"set focus";
+    f.onclick=()=>op({op:"focus",id:focusId===id?null:id});
+    foot.appendChild(f);
+    const flagged=(n.tags||[]).includes("for-claude");
+    const fl=document.createElement("button"); fl.className="btn";
+    fl.textContent=flagged?"clear flag":"flag for Claude";
+    if(flagged)fl.style.color=cssVar("--accent");
+    fl.title="surfaces this node in Claude's next tool-call hook";
+    fl.onclick=()=>{
+      const tags=(n.tags||[]).slice();
+      const i=tags.indexOf("for-claude");
+      if(i>=0)tags.splice(i,1); else tags.push("for-claude");
+      op({op:"update_node",id,tags});
+    };
+    foot.appendChild(fl);
+    const del=document.createElement("button"); del.className="btn";
+    del.textContent="delete"; del.style.color=cssVar("--task-blocked");
+    del.onclick=()=>{ if(confirm("delete "+n.title+"?"))
+      op({op:"del_node",id}); };
+    foot.appendChild(del);
+  }
+  const cp=document.createElement("button"); cp.className="btn";
+  cp.textContent="copy id"; cp.onclick=()=>navigator.clipboard?.writeText(id);
+  foot.appendChild(cp);
+}
+function field(lbl,el){
+  const r=document.createElement("div"); r.className="row";
+  const l=document.createElement("div"); l.className="lbl"; l.textContent=lbl;
+  r.appendChild(l); r.appendChild(el); return r;
+}
+function childrenVia(id,rel){
+  return graph.edges.filter(e=>e.from===id&&e.rel===rel).map(e=>e.to);
+}
+function expandPaths(id,seen){
+  seen=seen||new Set();
+  if(seen.has(id)||!graph.nodes[id])return [];
+  seen.add(id);
+  const n=graph.nodes[id];
+  if(n.type==="file")return n.path?[n.path]:[];
+  if(n.type==="folder"){
+    let o=[]; childrenVia(id,"contains").forEach(c=>o=o.concat(expandPaths(c,seen)));
+    return o;
+  }
+  let o=[]; childrenVia(id,"reads").forEach(c=>o=o.concat(expandPaths(c,seen)));
+  return o;
+}
+function readingList(id){
+  // {path,via,tid,direct}; inherited entries come from parent plans
+  const seen=new Set(), out=[];
+  function addFrom(srcId,direct){
+    childrenVia(srcId,"reads").forEach(tid=>{
+      const label=(graph.nodes[tid]||{}).title||tid;
+      expandPaths(tid).forEach(p=>{
+        if(!seen.has(p)){seen.add(p);
+          out.push({path:p,via:label,tid:tid,direct:direct});}
+      });
+    });
+  }
+  graph.edges.filter(e=>e.from===id&&e.rel==="implements")
+    .forEach(e=>addFrom(e.to,false));
+  addFrom(id,true);
+  return out;
+}
+function textEl(t){const d=document.createElement("div");
+  d.className="val"; d.textContent=t; return d;}
+function selectEl(opts,val,cb){
+  const s=document.createElement("select");
+  opts.forEach(o=>{const e=document.createElement("option");
+    e.value=o;e.textContent=o;if(o===val)e.selected=true;s.appendChild(e);});
+  s.onchange=()=>cb(s.value); return s;
+}
+function nbrEl(rel,id){
+  const n=graph.nodes[id]; const d=document.createElement("div");
+  d.className="nbr";
+  d.innerHTML="<span class='rel'>"+esc(rel)+"</span>"+
+    "<span class='pin' style='background:"+
+    (n?cssVar(typeColor(n)):"#555")+"'></span>"+
+    "<span>"+esc(n?n.title:id)+"</span>";
+  d.onclick=()=>{selected=id;centerOn(id);openPanel(id);};
+  return d;
+}
+function centerOn(id){
+  const p=pos.get(id); if(!p)return;
+  cam.x=-p.x*cam.s; cam.y=-p.y*cam.s; alpha=Math.max(alpha,.15);
+}
+function closePanel(){
+  document.getElementById("panel").classList.remove("open"); selected=null;
+}
+document.getElementById("pClose").onclick=closePanel;
+
+// ---- search / buttons ----
+// ---- search (in-memory dim + optional deep/global via /api/search) ----
+const searchEl=document.getElementById("search");
+const searchOpts=document.getElementById("searchopts");
+const searchResults=document.getElementById("searchresults");
+const searchDeep=document.getElementById("searchDeep");
+const searchGlobal=document.getElementById("searchGlobal");
+let _searchTimer=null;
+
+function showSearchResults(matches, isGlobal, total){
+  searchResults.innerHTML="";
+  if(!matches.length){
+    searchResults.innerHTML="<div style='padding:10px 14px;"+
+      "color:var(--dim);font-size:11px'>(no matches)</div>";
+    searchResults.classList.add("open");
+    return;
+  }
+  if(typeof total === "number" && total > matches.length){
+    const h=document.createElement("div");
+    h.style.cssText="padding:5px 14px;color:var(--faint);font-size:10px;"+
+      "border-bottom:1px solid var(--line);letter-spacing:.04em;"+
+      "text-transform:uppercase";
+    h.textContent="showing "+matches.length+" of "+total+
+      " - refine query to narrow";
+    searchResults.appendChild(h);
+  }
+  matches.forEach(m=>{
+    const r=document.createElement("div"); r.className="srow";
+    r.innerHTML="<span class='sty'>"+esc(m.type||"?")+"</span>"+
+      "<span class='stitle'>"+esc(m.title||m.id)+"</span>"+
+      (isGlobal?
+        "<span class='sproj'>"+esc(m.project||"")+
+        (m.serve_port?" <span class='slive'>● live</span>":"")+
+        "</span>":"");
+    r.onclick=()=>{
+      if(isGlobal){
+        if(m.serve_port){
+          window.open("http://127.0.0.1:"+m.serve_port+"/","_blank");
+          toast("opening "+m.project+"...","ok");
+        }else if(navigator.clipboard){
+          navigator.clipboard.writeText(m.project_path);
+          toast("copied "+m.project+" path (no live serve)","ok");
+        }
+      }else{
+        selected=m.id; openPanel(m.id); centerOn(m.id);
+        cam.s=Math.max(cam.s,.9);
+      }
+      searchResults.classList.remove("open");
+    };
+    searchResults.appendChild(r);
+  });
+  searchResults.classList.add("open");
+}
+
+function runApiSearch(){
+  const q=searchEl.value.trim();
+  if(!q){ searchResults.classList.remove("open"); return; }
+  const params=new URLSearchParams({q:q,n:"20"});
+  if(searchGlobal.checked) params.set("global","1");
+  fetch("/api/search?"+params.toString()).then(r=>r.json())
+    .then(d=>showSearchResults(d.matches||[], !!d.global, d.total));
+}
+
+searchEl.addEventListener("input",e=>{
+  const q=e.target.value.trim();
+  search=q.toLowerCase();
+  // local in-memory: dim non-matching, fly to first hit (legacy behavior)
+  if(search){
+    const hit=Object.values(graph.nodes).find(
+      n=>(n.title||"").toLowerCase().includes(search));
+    if(hit){cam.s=Math.max(cam.s,.9);centerOn(hit.id);}
+  }
+  // deep/global: debounced API call with results dropdown
+  clearTimeout(_searchTimer);
+  if(searchDeep.checked || searchGlobal.checked){
+    _searchTimer=setTimeout(runApiSearch, 220);
+  }else{
+    searchResults.classList.remove("open");
+  }
+});
+searchEl.addEventListener("focus",()=>{
+  if(MODE==="live") searchOpts.classList.add("open");
+});
+searchEl.addEventListener("keydown",ev=>{
+  if(ev.key==="Enter"){
+    ev.preventDefault();
+    const q=searchEl.value.trim(); if(!q) return;
+    // If deep/global is on, results panel is what we want to open.
+    // Otherwise click the first matching in-memory node directly.
+    if(searchResults.classList.contains("open")){
+      const first=searchResults.querySelector(".srow");
+      if(first){ first.click(); searchEl.blur(); return; }
+    }
+    const hit=Object.values(graph.nodes).find(
+      n=>(n.title||"").toLowerCase().includes(q.toLowerCase()));
+    if(hit){
+      selected=hit.id; openPanel(hit.id); centerOn(hit.id);
+      cam.s=Math.max(cam.s,.9);
+      searchEl.blur();
+    }else{
+      toast("no match for \""+q+"\"","err");
+    }
+  }
+});
+[searchDeep,searchGlobal].forEach(cb=>{
+  cb.addEventListener("change",()=>{
+    if(searchDeep.checked||searchGlobal.checked) runApiSearch();
+    else searchResults.classList.remove("open");
+  });
+});
+addEventListener("click",ev=>{
+  const wrap=document.getElementById("searchwrap");
+  if(wrap && !wrap.contains(ev.target)){
+    searchOpts.classList.remove("open");
+    searchResults.classList.remove("open");
+  }
+});
+document.getElementById("feedhead").onclick=()=>{
+  const w=document.getElementById("feedwrap");
+  w.classList.toggle("min");
+  document.getElementById("feedtoggle").textContent=
+    w.classList.contains("min")?"+":"\u2212";
+};
+document.getElementById("addBtn").onclick=()=>openAdd();
+document.getElementById("emptyAdd").onclick=()=>openAdd();
+
+// ---- actions menu (undo / history / sync / commit / re-layout) ----
+function toggleActions(){
+  const m=document.getElementById("actionsmenu");
+  m.classList.toggle("open");
+}
+function closeActions(){
+  document.getElementById("actionsmenu").classList.remove("open");
+}
+document.getElementById("actionsBtn").onclick=ev=>{
+  ev.stopPropagation(); toggleActions();
+};
+addEventListener("click",ev=>{
+  const m=document.getElementById("actionsmenu");
+  const w=document.getElementById("actionswrap");
+  if(m && m.classList.contains("open") && !w.contains(ev.target))
+    m.classList.remove("open");
+});
+document.querySelectorAll("#actionsmenu .amrow").forEach(row=>{
+  row.onclick=()=>{ closeActions(); doAction(row.dataset.act); };
+});
+function doAction(act){
+  if(MODE!=="live"){ toast("workspace is read-only (static view)","err"); return;}
+  if(act==="undo") doUndo();
+  else if(act==="history") openHistory();
+  else if(act==="sync") doSync({});
+  else if(act==="scan") doSync({scan:true,tree:true});
+  else if(act==="prune") doSync({prune_missing:true});
+  else if(act==="commit") openCommit();
+  else if(act==="relayout"){
+    for(const p of pos.values())p.fixed=false; alpha=1;
+  }
+}
+function doUndo(){
+  op({op:"undo"}).then(r=>{
+    if(r.error){ toast(r.error,"err"); return; }
+    toast("undid to rev "+r.restored_rev+
+          " ("+r.nodes+" nodes, "+r.edges+" edges)","ok");
+  });
+}
+function doSync(args){
+  const label=args.scan?"scanning project files...":
+              args.prune_missing?"pruning missing files...":
+              "syncing...";
+  toast(label,"ok",0);  // sticky until response lands
+  op(Object.assign({op:"sync"},args)).then(r=>{
+    if(r.error){ toast(r.error,"err"); return; }
+    toast(r.summary||"sync done","ok");
+  });
+}
+function openHistory(){
+  const ov=document.getElementById("history");
+  ov.classList.add("open");
+  const list=document.getElementById("histlist");
+  list.innerHTML="<div style='padding:14px;color:var(--dim);"+
+    "font-size:11px'>loading...</div>";
+  fetch("/api/history?n=30").then(r=>r.json()).then(d=>{
+    const items=d.history||[];
+    if(!items.length){
+      list.innerHTML="<div style='padding:14px;color:var(--dim);"+
+        "font-size:11px'>(no snapshots yet)</div>";
+      return;
+    }
+    list.innerHTML="";
+    items.forEach(it=>{
+      const r=document.createElement("div");
+      r.style.cssText="display:flex;justify-content:space-between;"+
+        "padding:7px 14px;border-bottom:1px solid var(--line);"+
+        "font-size:11px;cursor:pointer;align-items:center;gap:10px";
+      if(it.is_current) r.style.cssText+=";background:rgba(10,132,255,.10)";
+      r.onmouseenter=()=>r.style.background="rgba(10,132,255,.18)";
+      r.onmouseleave=()=>r.style.background=it.is_current?
+        "rgba(10,132,255,.10)":"";
+      r.innerHTML="<div><span style='font-family:JetBrains Mono,monospace;"+
+        "color:var(--accent)'>rev "+it.rev+"</span>"+
+        (it.is_current?" <span class='muted' style='font-size:9px'>(current)</span>":"")+
+        "<div style='color:var(--dim);font-size:10px;margin-top:2px'>"+
+        esc(it.last)+"</div></div>"+
+        "<div style='color:var(--faint);font-size:10px;text-align:right'>"+
+        it.nodes+" nodes<br>"+esc((it.ts||"").slice(11,16))+"</div>";
+      r.onclick=()=>{
+        if(it.is_current) return;
+        if(!confirm("Restore rev "+it.rev+"? This becomes a new snapshot."))return;
+        op({op:"undo",to:it.rev}).then(rr=>{
+          if(rr.error){ toast(rr.error,"err"); return; }
+          toast("restored rev "+it.rev,"ok");
+          document.getElementById("history").classList.remove("open");
+        });
+      };
+      list.appendChild(r);
+    });
+  });
+}
+document.getElementById("histClose").onclick=()=>
+  document.getElementById("history").classList.remove("open");
+
+function openCommit(){
+  document.getElementById("cSha").value="";
+  document.getElementById("cSince").value="";
+  document.getElementById("commit").classList.add("open");
+  setTimeout(()=>document.getElementById("cSha").focus(),50);
+}
+document.getElementById("cCancel").onclick=()=>
+  document.getElementById("commit").classList.remove("open");
+document.getElementById("cGo").onclick=()=>{
+  const sha=document.getElementById("cSha").value.trim();
+  const since=document.getElementById("cSince").value.trim();
+  const args={op:"commit"};
+  if(since) args.since=since;
+  else if(sha) args.sha=sha;
+  toast("linking commit...","ok",0);
+  op(args).then(r=>{
+    if(r.error){ toast(r.error,"err"); return; }
+    // Format the CLI summary into something friendlier. Common shapes:
+    //   "milestone n_xxx for git ABCDEFGH  subject text"
+    //   "linked N commit(s)"
+    //   "nothing new linked  (M already linked)"
+    let msg=r.summary||"commit linked";
+    let m=msg.match(/milestone\s+(n_\w+)\s+for\s+git\s+([0-9a-f]+)\s+(.*)/i);
+    if(m) msg="linked git "+m[2]+" - "+m[3].replace(/\s*\(.*\)$/,"");
+    else {
+      m=msg.match(/linked\s+(\d+)\s+commit/);
+      if(m) msg="linked "+m[1]+" commits";
+    }
+    toast(msg,"ok");
+    document.getElementById("commit").classList.remove("open");
+  });
+};
+document.getElementById("fit").onclick=()=>{fitView();alpha=Math.max(alpha,.05);};
+document.getElementById("projcaret").onclick=ev=>{
+  ev.stopPropagation();
+  const m=document.getElementById("projmenu");
+  if(m.classList.contains("open")){m.classList.remove("open");return;}
+  m.classList.add("open");
+  m.innerHTML="<div class='projmsg'>loading...</div>";
+  fetch("/api/projects").then(r=>r.json()).then(d=>{
+    const items=d.projects||[];
+    if(!items.length){
+      m.innerHTML="<div class='projmsg'>no other weave projects "+
+        "registered. run <code>weave init</code> in other repos to add them.</div>";
+      return;
+    }
+    m.innerHTML="";
+    items.forEach(pp=>{
+      const r=document.createElement("div");
+      const liveBadge=pp.serve_port?" <span class='ps' style='color:var(--task-done)'>● live</span>":"";
+      r.className="projrow"+(pp.is_self?" self":"");
+      r.innerHTML="<div style='flex:1;min-width:0'><div class='pn'>"+
+        esc(pp.name||"?")+(pp.is_self?" (this)":"")+liveBadge+
+        "</div><div class='pp'>"+esc(pp.path)+"</div></div>"+
+        "<div class='ps'>r"+pp.rev+" / "+pp.nodes+"n</div>";
+      if(pp.serve_port && !pp.is_self){
+        r.title="click to open this project's workspace in a new tab";
+        r.onclick=()=>{
+          window.open("http://127.0.0.1:"+pp.serve_port+"/","_blank");
+          toast("opening "+pp.name+"...","ok");
+        };
+      }else if(!pp.is_self){
+        r.title="click to copy path (serve not running)";
+        r.onclick=()=>{
+          if(navigator.clipboard){
+            navigator.clipboard.writeText(pp.path).then(
+              ()=>toast("copied path: "+pp.name,"ok"),
+              ()=>toast("clipboard not available","err"));
+          }else{
+            toast("clipboard not available","err");
+          }
+        };
+      }else{
+        r.title="this project";
+        r.style.cursor="default";
+      }
+      m.appendChild(r);
+    });
+  }).catch(()=>{
+    m.innerHTML="<div class='projmsg'>failed to load projects.</div>";
+  });
+};
+addEventListener("click",ev=>{
+  const m=document.getElementById("projmenu");
+  const w=document.getElementById("projwrap");
+  if(m && m.classList.contains("open") && !w.contains(ev.target))
+    m.classList.remove("open");
+});
+document.getElementById("treeBtn").onclick=()=>toggleTree();
+document.getElementById("treeClose").onclick=()=>toggleTree();
+document.getElementById("treeExpand").onclick=()=>{
+  treeCollapsed.clear(); renderTree();
+};
+document.getElementById("treeCollapse").onclick=()=>{
+  for(const id in graph.nodes){
+    const n=graph.nodes[id];
+    if(n.type==="folder") treeCollapsed.add(id);
+  }
+  renderTree();
+};
+document.getElementById("treesearch").addEventListener("input",ev=>{
+  treeSearch=ev.target.value.trim();
+  renderTree();
+});
+document.getElementById("helpBtn").onclick=()=>showHelp(true);
+document.getElementById("helpClose").onclick=()=>showHelp(false);
+document.getElementById("aCancel").onclick=()=>
+  document.getElementById("add").classList.remove("open");
+
+// ---- keyboard shortcuts ----
+const SHORTCUTS=[
+  ["/","focus search"],["n","new node"],["z","zoom to fit"],
+  ["t","toggle folder tree panel"],
+  ["u","undo last graph change"],["h","open history (snapshot list)"],
+  ["g","link git commit(s)"],
+  ["r","re-run layout"],["f","toggle focus on selected node"],
+  ["esc","close panel / dialog"],["?","this help"],
+  ["shift-drag","node \u2192 node to create a link"],
+  ["double-click","empty space to add a node"],
+];
+function showHelp(on){
+  const ov=document.getElementById("help");
+  if(on){
+    const g=document.getElementById("hgrid"); g.innerHTML="";
+    SHORTCUTS.forEach(([k,d])=>{
+      const kk=document.createElement("div"); kk.className="k";
+      kk.innerHTML="<kbd>"+esc(k)+"</kbd>";
+      const dd=document.createElement("div"); dd.className="d";
+      dd.textContent=d;
+      g.appendChild(kk); g.appendChild(dd);
+    });
+  }
+  ov.classList.toggle("open",on);
+}
+function anyOverlayOpen(){
+  return document.getElementById("add").classList.contains("open")||
+    document.getElementById("help").classList.contains("open")||
+    document.getElementById("link").classList.contains("open")||
+    document.getElementById("history").classList.contains("open")||
+    document.getElementById("commit").classList.contains("open");
+}
+addEventListener("keydown",e=>{
+  if(e.key==="Escape"){
+    document.getElementById("add").classList.remove("open");
+    document.getElementById("link").classList.remove("open");
+    document.getElementById("help").classList.remove("open");
+    document.getElementById("history").classList.remove("open");
+    document.getElementById("commit").classList.remove("open");
+    closeActions();
+    closePanel(); return;
+  }
+  const typing=/^(INPUT|TEXTAREA|SELECT)$/.test(
+    (e.target.tagName||""));
+  if(typing||e.metaKey||e.ctrlKey||e.altKey)return;
+  if(e.key==="/"){e.preventDefault();
+    document.getElementById("search").focus();return;}
+  if(e.key==="?"){showHelp(true);return;}
+  if(anyOverlayOpen())return;
+  if(e.key==="n"&&MODE==="live"){openAdd();}
+  else if(e.key==="z"){fitView();alpha=Math.max(alpha,.05);}
+  else if(e.key==="t"){toggleTree();}
+  else if(e.key==="r"){for(const p of pos.values())p.fixed=false;alpha=1;}
+  else if(e.key==="u"&&MODE==="live"){doUndo();}
+  else if(e.key==="h"&&MODE==="live"){openHistory();}
+  else if(e.key==="g"&&MODE==="live"){openCommit();}
+  else if(e.key==="f"&&selected&&MODE==="live"){
+    op({op:"focus",id:focusId===selected?null:selected});}
+});
+
+// ---- link dialog (shift-drag result) ----
+function openLink(from,to){
+  if(MODE!=="live"){op({});return;}
+  const ov=document.getElementById("link");
+  document.getElementById("lFrom").textContent=
+    (graph.nodes[from]||{}).title||from;
+  document.getElementById("lTo").textContent=
+    (graph.nodes[to]||{}).title||to;
+  const sel=document.getElementById("lRel"); sel.innerHTML="";
+  RELS.forEach(r=>{const o=document.createElement("option");
+    o.value=r;o.textContent=r;sel.appendChild(o);});
+  // sensible default by node types
+  const ft=(graph.nodes[from]||{}).type,tt=(graph.nodes[to]||{}).type;
+  let def="relates_to";
+  if(ft==="task"&&(tt==="plan"||tt==="milestone"))def="implements";
+  else if(tt==="file"||tt==="folder")def="reads";
+  sel.value=def;
+  ov.dataset.from=from; ov.dataset.to=to;
+  ov.classList.add("open");
+}
+document.getElementById("lSave").onclick=()=>{
+  const ov=document.getElementById("link");
+  op({op:"add_edge",from:ov.dataset.from,to:ov.dataset.to,
+      rel:document.getElementById("lRel").value});
+  ov.classList.remove("open");
+};
+document.getElementById("lCancel").onclick=()=>
+  document.getElementById("link").classList.remove("open");
+
+function openAdd(){
+  const at=document.getElementById("aType"); at.innerHTML="";
+  TYPES.forEach(t=>{const o=document.createElement("option");
+    o.value=t;o.textContent=t;at.appendChild(o);});
+  const ap=document.getElementById("aParent"); ap.innerHTML="";
+  const none=document.createElement("option");
+  none.value="";none.textContent="(none)";ap.appendChild(none);
+  Object.values(graph.nodes)
+    .filter(n=>n.type==="plan"||n.type==="milestone")
+    .forEach(n=>{const o=document.createElement("option");
+      o.value=n.id;o.textContent=n.type+": "+n.title;ap.appendChild(o);});
+  document.getElementById("aTitle").value="";
+  document.getElementById("aBody").value="";
+  document.getElementById("add").classList.add("open");
+  document.getElementById("aTitle").focus();
+}
+document.getElementById("aSave").onclick=()=>{
+  const title=document.getElementById("aTitle").value.trim();
+  if(!title){document.getElementById("aTitle").focus();return;}
+  const req={op:"add_node",type:document.getElementById("aType").value,
+    title,body:document.getElementById("aBody").value};
+  const par=document.getElementById("aParent").value;
+  if(par){req.parent=par;
+    req.rel=req.type==="task"?"implements":"relates_to";}
+  op(req);
+  document.getElementById("add").classList.remove("open");
+};
+
+// ---- live sync ----
+function op(req){
+  if(MODE!=="live"){alert("read-only snapshot. run `weave serve` to edit.");
+    return;}
+  fetch("/api/op",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(req)})
+    .then(r=>r.json()).then(()=>poll(true)).catch(()=>{});
+}
+let lastRev=-1, prevIds=null;
+function poll(force){
+  if(MODE!=="live")return;
+  fetch("/api/graph?rev="+(force?-1:lastRev))
+    .then(r=>r.json()).then(g=>{
+      if(g.unchanged)return;
+      applyGraph(g);
+    }).catch(()=>setLive(false));
+}
+function applyGraph(g){
+  // detect what changed vs previous state -> feed + pop animation
+  if(prevIds){
+    for(const id in g.nodes){
+      if(!prevIds.has(id)){
+        popIds.add(id); popClock.set(id,performance.now());
+        feed("+ "+g.nodes[id].type+": "+g.nodes[id].title,
+             g.nodes[id].author);
+      }
+    }
+  }
+  prevIds=new Set(Object.keys(g.nodes));
+  lastRev=g.meta.rev;
+  ingest(g);
+}
+function setLive(on,mode){
+  document.getElementById("livedot").className="dot"+(on?"":" off");
+  document.getElementById("livetxt").textContent=
+    on?(mode||"live"):"offline";
+}
+
+// ---- activity feed ----
+const popIds=new Set(), popClock=new Map();
+function feed(text,who,nid){
+  const el=document.getElementById("feed");
+  if(!el)return;
+  const row=document.createElement("div");
+  row.className="frow"+(who==="claude"?" claude":"");
+  const hasNode=nid && graph.nodes[nid];
+  if(hasNode){
+    row.dataset.nid=nid;
+    row.style.cursor="pointer";
+    row.title="jump to "+(graph.nodes[nid].title||nid);
+  }
+  const t=new Date().toLocaleTimeString().slice(0,5);
+  row.innerHTML="<span class='ft'>"+t+"</span>"+
+    "<span class='fw'>"+esc(who||"?")+"</span>"+
+    "<span class='fx'>"+esc(text)+"</span>";
+  if(hasNode){
+    row.onclick=()=>{
+      if(!graph.nodes[nid])return;        // node may have been removed
+      selected=nid; openPanel(nid); centerOn(nid);
+      cam.s=Math.max(cam.s,.9);
+    };
+  }
+  el.insertBefore(row,el.firstChild);
+  while(el.children.length>40)el.removeChild(el.lastChild);
+  el.classList.add("flash");
+  setTimeout(()=>el.classList.remove("flash"),600);
+}
+let lastLogLen=0;
+function syncFeed(g){
+  // surface graph log events authored by claude as they arrive
+  const log=g.log||[];
+  if(lastLogLen===0){lastLogLen=log.length;return;}
+  for(let i=lastLogLen;i<log.length;i++){
+    const ev=log[i];
+    if(ev.actor==="claude")feed(ev.action,"claude",ev.node);
+  }
+  lastLogLen=log.length;
+}
+
+// ---- boot ----
+if(MODE==="live"){
+  setLive(true,"connecting");
+  poll(true);
+  let es=null, pollTimer=null;
+  function startPoll(){
+    if(pollTimer)return;
+    pollTimer=setInterval(()=>poll(false),2000);
+  }
+  function connectSSE(){
+    try{
+      es=new EventSource("/api/stream");
+      es.addEventListener("graph",e=>{
+        if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+        setLive(true,"live \u00b7 push");
+        try{
+          const g=JSON.parse(e.data);
+          syncFeed(g); applyGraph(g);
+        }catch(_){}
+      });
+      es.onerror=()=>{
+        setLive(true,"live \u00b7 poll");
+        startPoll();           // fall back; EventSource auto-retries
+      };
+    }catch(_){ startPoll(); }
+  }
+  connectSSE();
+  startPoll();                 // safety net until first SSE frame
+}else{
+  document.getElementById("livedot").className="dot off";
+  document.getElementById("livetxt").textContent="snapshot";
+  ingest(BOOT||{meta:{},nodes:{},edges:[],log:[]});
+}
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="weave",
+        description="cooperation space + unified graph for coding with Claude")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("init", help="scaffold weave in this project")
+    s.add_argument("--name")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("add", help="add a node")
+    s.add_argument("type", choices=NODE_TYPES)
+    s.add_argument("title")
+    s.add_argument("--body")
+    s.add_argument("--tags")
+    s.add_argument("--status")
+    s.add_argument("--path")
+    s.add_argument("--parent", help="link new node to this node")
+    s.add_argument("--rel", help="rel for --parent edge")
+    s.add_argument("--author", default="claude", choices=["claude", "human"])
+    s.add_argument("--tier", choices=TIERS,
+                   help="memory tier (default 'active')")
+    s.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("link", help="add an edge: weave link FROM TO REL")
+    s.add_argument("src")
+    s.add_argument("dst")
+    s.add_argument("rel")
+    s.set_defaults(fn=cmd_link)
+
+    s = sub.add_parser("unlink", help="remove an edge")
+    s.add_argument("src")
+    s.add_argument("dst")
+    s.add_argument("rel", nargs="?")
+    s.set_defaults(fn=cmd_unlink)
+
+    s = sub.add_parser("set", help="update a node")
+    s.add_argument("node")
+    s.add_argument("--status")
+    s.add_argument("--title")
+    s.add_argument("--body")
+    s.add_argument("--tags")
+    s.add_argument("--tier", choices=TIERS)
+    s.set_defaults(fn=cmd_set)
+
+    s = sub.add_parser("pin", help="mark node as pinned (always-surfaced)")
+    s.add_argument("node")
+    s.set_defaults(fn=cmd_pin)
+
+    s = sub.add_parser("archive",
+                       help="archive a node (hidden from status / hooks)")
+    s.add_argument("node")
+    s.set_defaults(fn=cmd_archive)
+
+    s = sub.add_parser("unarchive",
+                       help="restore an archived/pinned node to active")
+    s.add_argument("node")
+    s.set_defaults(fn=cmd_unarchive)
+
+    s = sub.add_parser("rm", help="remove a node")
+    s.add_argument("node")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("focus",
+                       help="show focus; set it with <plan>, clear with 'clear'")
+    s.add_argument("node", nargs="?")
+    s.set_defaults(fn=cmd_focus)
+
+    s = sub.add_parser("ls", help="list nodes")
+    s.add_argument("--type", choices=NODE_TYPES)
+    s.add_argument("--status")
+    s.add_argument("--tag")
+    s.add_argument("--tier", choices=TIERS)
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("search",
+                       help="free-text search across titles, bodies, tags")
+    s.add_argument("query")
+    s.add_argument("-n", type=int, default=30, help="max results per project")
+    s.add_argument("--global", dest="global_", action="store_true",
+                   help="search every project in ~/.weave_index.json")
+    s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("show", help="show one node + its connections")
+    s.add_argument("node")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("status", help="project dashboard")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("inbox", help="human->Claude messages")
+    s.add_argument("file", nargs="?")
+    s.add_argument("--done", action="store_true", help="archive a file")
+    s.set_defaults(fn=cmd_inbox)
+
+    s = sub.add_parser("note", help="quick human note into the graph")
+    s.add_argument("text", nargs="+")
+    s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser("log", help="recent activity")
+    s.add_argument("-n", type=int, default=20)
+    s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("history",
+                       help="recent graph snapshots (one per save)")
+    s.add_argument("-n", type=int, default=20)
+    s.set_defaults(fn=cmd_history)
+
+    s = sub.add_parser("undo",
+                       help="restore the previous snapshot (or --to <rev>)")
+    s.add_argument("--to", type=int,
+                   help="restore a specific rev from `weave history`")
+    s.add_argument("--actor", default="human")
+    s.set_defaults(fn=cmd_undo)
+
+    s = sub.add_parser("commit",
+                       help="link git commit(s) as milestone(s)")
+    s.add_argument("sha", nargs="?",
+                   help="single git ref to link (default HEAD)")
+    s.add_argument("--since", help="link every commit in <since>..HEAD "
+                                   "(oldest first)")
+    s.set_defaults(fn=cmd_commit)
+
+    s = sub.add_parser("projects",
+                       help="list/manage the cross-project index "
+                            "(~/.weave_index.json)")
+    s.add_argument("--add", help="register a weave project path")
+    s.add_argument("--remove", help="unregister a project path")
+    s.add_argument("--prune", action="store_true",
+                   help="drop entries whose .weave/ no longer exists")
+    s.set_defaults(fn=cmd_projects)
+
+    s = sub.add_parser("sync", help="refresh file nodes (--scan imports all)")
+    s.add_argument("--scan", action="store_true",
+                   help="import all project source files; "
+                        "also enables rename detection by content hash")
+    s.add_argument("--tree", action="store_true",
+                   help="build folder nodes mirroring the directory tree")
+    s.add_argument("--prune-missing", action="store_true",
+                   help="remove file nodes whose path no longer exists")
+    s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("attach", help="route files/folders to a task: "
+                       "weave attach TASK PATH...")
+    s.add_argument("node")
+    s.add_argument("targets", nargs="+",
+                   help="file/folder paths or node ids/titles to attach")
+    s.set_defaults(fn=cmd_attach)
+
+    s = sub.add_parser("detach", help="remove a reading link")
+    s.add_argument("node")
+    s.add_argument("targets", nargs="+")
+    s.set_defaults(fn=cmd_detach)
+
+    s = sub.add_parser("context", help="show the reading list for a node")
+    s.add_argument("node")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_context)
+
+    s = sub.add_parser("demo", help="seed an example graph")
+    s.set_defaults(fn=cmd_demo)
+
+    s = sub.add_parser("view", help="write a static graph.html snapshot")
+    s.add_argument("--no-open", action="store_true")
+    s.set_defaults(fn=cmd_view)
+
+    s = sub.add_parser("serve", help="run the live browser workspace")
+    s.add_argument("--port", type=int, default=4747)
+    s.add_argument("--no-open", action="store_true")
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("mcp", help="run the MCP server (stdio) for Claude")
+    s.set_defaults(fn=cmd_mcp)
+
+    s = sub.add_parser("_hook-session")
+    s.set_defaults(fn=cmd_hook_session)
+    s = sub.add_parser("_hook-postuse")
+    s.set_defaults(fn=cmd_hook_postuse)
+    s = sub.add_parser("_hook-pretool")
+    s.set_defaults(fn=cmd_hook_pretool)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "fn", None):
+        parser.print_help()
+        return
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
