@@ -7,11 +7,44 @@ starting from zero every time.
 
 ## Install
 
-You can install weave two ways. The **plugin** route is shorter and handles all the
-wiring for you. The **standalone CLI** gives you the script as a normal binary on
-`PATH` if you'd rather not use the Claude Code plugin system.
+Three install routes. **Option A** is the shortest — one line in a terminal and
+weave's MCP tools and `/weave-*` commands light up in every Claude Code session
+you open, no per-project wiring.
 
-### Option A — as a Claude Code plugin (recommended)
+### Option A — one terminal command (recommended)
+
+**macOS / Linux:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OskarAndreasBerg-Procano/weave/main/install.sh | sh
+```
+
+**Windows PowerShell:**
+
+```powershell
+irm https://raw.githubusercontent.com/OskarAndreasBerg-Procano/weave/main/install.ps1 | iex
+```
+
+That script:
+
+1. Downloads `weave` to `~/.local/bin/weave` (Unix) or `%USERPROFILE%\bin\weave` (Windows).
+2. Adds that directory to `PATH` if it isn't already.
+3. Registers the weave MCP server with Claude Code at **user scope** (`claude mcp add --scope user`), so the `weave_*` tools show up in every session.
+4. Drops the `/weave-*` slash commands into `~/.claude/commands/` for global availability.
+
+Open Claude Code anywhere — the `weave_*` tools are live. To start a graph in
+a project:
+
+```bash
+cd your-project
+weave init           # creates .weave/graph.json + CLAUDE.md weave block
+weave serve          # opens the live workspace at 127.0.0.1:4747
+```
+
+Already installed and want it gone? `weave uninstall`. (Per-project `.weave/`
+graphs are untouched.)
+
+### Option B — as a Claude Code plugin
 
 In Claude Code, run:
 
@@ -31,7 +64,7 @@ Claude Code install. Then in any project:
 `/weave:init` creates `.weave/graph.json` and a `weave` block in `CLAUDE.md`. The plugin
 already provides hooks, MCP, and commands globally, so there's no per-project plumbing.
 
-### Option B — standalone CLI
+### Option C — manual standalone CLI
 
 Requires **Python 3** and **Claude Code**.
 
@@ -180,11 +213,13 @@ In Claude Code:
 ## Repo layout
 
 ```
-weave                            # standalone single-file Python CLI (Option B users grab this)
-.claude-plugin/marketplace.json  # marketplace manifest (Option A entry point)
+weave                            # the single-file Python CLI (Options A & C pull this)
+install.sh                       # POSIX terminal one-liner installer (Option A)
+install.ps1                      # Windows PowerShell installer (Option A)
+.claude-plugin/marketplace.json  # marketplace manifest (Option B entry point)
 plugins/weave/                   # the plugin
   .claude-plugin/plugin.json
-  bin/weave                      # bundled copy of the script (Option A install consumes this)
+  bin/weave                      # bundled copy of the script (Option B install consumes this)
   hooks/hooks.json               # SessionStart / PreToolUse / PostToolUse
   commands/*.md                  # /weave:* slash commands
 ```

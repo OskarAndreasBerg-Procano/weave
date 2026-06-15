@@ -394,6 +394,89 @@ def upsert_folder_node(g: dict, relpath: str) -> str:
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
+def cmd_install(args):
+    """Register weave globally with Claude Code so weave_* MCP tools and
+    /weave-* slash commands are available in every session, no per-project
+    wiring. Idempotent."""
+    here = SELF_PATH
+    py = PY_CMD
+    # 1. Register MCP server at user scope via the claude CLI
+    claude = shutil.which("claude")
+    if not claude:
+        print("weave install: 'claude' CLI not on PATH. Install Claude "
+              "Code from https://claude.com/code first, then re-run "
+              "'weave install'.")
+        return 1
+    cmd = [claude, "mcp", "add", "--scope", "user", "weave", "--",
+           py, here, "mcp"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        print("weave install: failed to invoke claude mcp add: %s" % e)
+        return 1
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        # treat already-registered as success
+        if "already" in err.lower() or "exists" in err.lower():
+            print("- MCP server already registered at user scope")
+        else:
+            print("weave install: claude mcp add failed: %s" % err)
+            return 1
+    else:
+        print("+ MCP server registered at user scope")
+
+    # 2. Drop user-scope slash commands so /weave-* works everywhere
+    home = os.path.expanduser("~")
+    cmds_dir = os.path.join(home, ".claude", "commands")
+    os.makedirs(cmds_dir, exist_ok=True)
+    for fn, body in COMMANDS.items():
+        with open(os.path.join(cmds_dir, fn), "w",
+                  encoding="utf-8") as f:
+            f.write(body + "\n")
+    print("+ slash commands installed at %s" % cmds_dir)
+
+    print()
+    print("weave is ready. open Claude Code anywhere - the weave_* tools "
+          "will be available.")
+    print("in any project, run:  weave init    (creates .weave/graph.json)")
+    return 0
+
+
+def cmd_uninstall(args):
+    """Remove the user-scope MCP registration and global slash commands.
+    Does not touch per-project .weave/ graphs or .mcp.json files."""
+    home = os.path.expanduser("~")
+    claude = shutil.which("claude")
+    if claude:
+        cmd = [claude, "mcp", "remove", "--scope", "user", "weave"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=15)
+            if r.returncode == 0:
+                print("+ MCP server unregistered (user scope)")
+            else:
+                print("- MCP server: %s" %
+                      ((r.stderr or r.stdout).strip() or "not registered"))
+        except Exception as e:
+            print("- MCP server: claude CLI error: %s" % e)
+    else:
+        print("- 'claude' CLI not found; skipping MCP unregister")
+    cmds_dir = os.path.join(home, ".claude", "commands")
+    removed = 0
+    if os.path.isdir(cmds_dir):
+        for fn in COMMANDS.keys():
+            fp = os.path.join(cmds_dir, fn)
+            try:
+                os.remove(fp)
+                removed += 1
+            except OSError:
+                pass
+    print("+ %d user-scope slash command file(s) removed" % removed)
+    print()
+    print("weave uninstalled. per-project .weave/ graphs are untouched.")
+    return 0
+
+
 def cmd_init(args):
     root = find_root() or os.getcwd()
     p = paths(root)
@@ -2506,7 +2589,20 @@ def serve(root, port, do_open):
                 return {"ok": True, "summary": buf.getvalue().strip()}
             return {"error": "unknown op"}
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    class _QuietServer(ThreadingHTTPServer):
+        """ThreadingHTTPServer that doesn't dump a traceback every time the
+        browser drops a connection (tab close, refresh during an SSE stream,
+        etc). Those errors are expected, not bugs - swallow them silently
+        so stderr stays readable and harnesses don't flag the process."""
+        def handle_error(self, request, client_address):
+            etype, e = sys.exc_info()[:2]
+            if etype and issubclass(etype, (BrokenPipeError,
+                                            ConnectionAbortedError,
+                                            ConnectionResetError)):
+                return
+            super().handle_error(request, client_address)
+
+    httpd = _QuietServer(("127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d/" % port
     # Drop a .serve marker so OTHER weave workspaces can list us + offer
     # to open this project in a new tab. Removed on clean shutdown.
@@ -4499,6 +4595,16 @@ def build_parser():
         prog="weave",
         description="cooperation space + unified graph for coding with Claude")
     sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("install",
+                       help="register weave globally with Claude Code "
+                            "(user-scope MCP + slash commands)")
+    s.set_defaults(fn=cmd_install)
+
+    s = sub.add_parser("uninstall",
+                       help="undo 'weave install' - removes user-scope "
+                            "MCP + slash commands (keeps project graphs)")
+    s.set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("init", help="scaffold weave in this project")
     s.add_argument("--name")
