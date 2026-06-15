@@ -224,4 +224,3 @@ plugins/weave/                   # the plugin
   commands/*.md                  # /weave:* slash commands
 ```
 
-Ping Oskar with anything else.
