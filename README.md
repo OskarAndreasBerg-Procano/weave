@@ -9,6 +9,51 @@ the single-file `weave` CLI plus this install + first-run guide.
 questions for a project. Both you and Claude Code read and write it, so you have a
 persistent shared memory across sessions instead of starting from zero every time.
 
+## The live workspace
+
+Run `weave serve` to open an interactive view of the whole graph in your browser at
+**<http://127.0.0.1:4747/>** (local only — it binds to `127.0.0.1`, so it is never exposed
+to your network). The browser opens automatically, and the view updates live as you and
+Claude change the graph.
+
+It is a dark, Apple-Finance-style workspace showing:
+
+- **Plans and their tasks** with status at a glance (todo / doing / done / blocked), and
+  the current **focus** plan highlighted.
+- **Decisions, files, questions, notes, and milestones**, plus the edges that connect them
+  (implements, depends_on, blocks, …).
+- **Search and filtering** across nodes, and a git-commit inspector (look up work by
+  `HEAD`, a SHA, or a branch name).
+- **Adding nodes from the UI** — a short title plus a "detail for Claude" body.
+
+Change the port with `weave serve --port <n>`.
+
+> 📸 To show a preview here, run `weave serve`, take a screenshot, save it as
+> `docs/workspace.png`, and add `![weave workspace](docs/workspace.png)` to this section.
+
+### Viewing it over SSH (remote server)
+
+If you run `weave serve` on a remote machine over SSH, it still binds to *that* machine's
+`127.0.0.1:4747`, which your laptop cannot reach directly. Forward the port through an SSH
+tunnel by connecting with `-L`:
+
+```bash
+# from your local machine — connect with the port forwarded:
+ssh -L 4747:127.0.0.1:4747 user@server
+```
+
+Then, on the server, start it without trying to launch a browser:
+
+```bash
+weave serve --no-open
+```
+
+…and open **<http://127.0.0.1:4747/>** in your *local* browser. The tunnel maps your local
+4747 to the server's 4747.
+
+> Already connected? Add the forward without reconnecting: press `Enter`, then type `~C`
+> to get the `ssh>` prompt, and enter `-L 4747:127.0.0.1:4747`.
+
 ## Prerequisites
 
 - **Python 3** (any recent version). Check: `python3 --version`.
