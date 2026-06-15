@@ -1,0 +1,21 @@
+{
+  "name": "weave",
+  "displayName": "Weave — shared cooperation graph",
+  "version": "1.0.0",
+  "description": "A shared project graph for you and Claude. Plans, tasks, decisions, files and questions live in one JSON-backed graph with a live web workspace, slash commands, hooks and an MCP server. Single Python file, stdlib only, no network.",
+  "author": {
+    "name": "Oskar Andreas Berg",
+    "url": "https://github.com/OskarAndreasBerg-Procano"
+  },
+  "homepage": "https://github.com/OskarAndreasBerg-Procano/weave",
+  "repository": "https://github.com/OskarAndreasBerg-Procano/weave",
+  "license": "MIT",
+  "keywords": ["mcp", "graph", "tasks", "cooperation", "memory", "workspace"],
+  "mcpServers": {
+    "weave": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/weave", "mcp"]
+    }
+  },
+  "hooks": "./hooks/hooks.json"
+}

@@ -2506,20 +2506,7 @@ def serve(root, port, do_open):
                 return {"ok": True, "summary": buf.getvalue().strip()}
             return {"error": "unknown op"}
 
-    class _QuietServer(ThreadingHTTPServer):
-        """ThreadingHTTPServer that doesn't dump a traceback every time the
-        browser drops a connection (tab close, refresh during an SSE stream,
-        etc). Those errors are expected, not bugs - swallow them silently
-        so stderr stays readable and harnesses don't flag the process."""
-        def handle_error(self, request, client_address):
-            etype, e = sys.exc_info()[:2]
-            if etype and issubclass(etype, (BrokenPipeError,
-                                            ConnectionAbortedError,
-                                            ConnectionResetError)):
-                return
-            super().handle_error(request, client_address)
-
-    httpd = _QuietServer(("127.0.0.1", port), Handler)
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = "http://127.0.0.1:%d/" % port
     # Drop a .serve marker so OTHER weave workspaces can list us + offer
     # to open this project in a new tab. Removed on clean shutdown.

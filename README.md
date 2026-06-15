@@ -5,7 +5,33 @@ A single-file cooperation-graph tool for Claude Code. `weave` keeps a shared
 you and Claude read and write — a persistent shared memory across sessions instead of
 starting from zero every time.
 
-## Quick install
+## Install
+
+You can install weave two ways. The **plugin** route is shorter and handles all the
+wiring for you. The **standalone CLI** gives you the script as a normal binary on
+`PATH` if you'd rather not use the Claude Code plugin system.
+
+### Option A — as a Claude Code plugin (recommended)
+
+In Claude Code, run:
+
+```
+/plugin marketplace add OskarAndreasBerg-Procano/weave
+/plugin install weave@weave
+```
+
+That registers the MCP server, hooks, and `/weave:*` slash commands globally for your
+Claude Code install. Then in any project:
+
+```
+/weave:init
+/weave:serve
+```
+
+`/weave:init` creates `.weave/graph.json` and a `weave` block in `CLAUDE.md`. The plugin
+already provides hooks, MCP, and commands globally, so there's no per-project plumbing.
+
+### Option B — standalone CLI
 
 Requires **Python 3** and **Claude Code**.
 
@@ -42,9 +68,13 @@ Commit `.weave/graph.json` — it's the shared memory. The per-machine wiring (`
 
 ## See the live workspace
 
-Run `weave serve` to open the graph in your browser at **<http://127.0.0.1:4747/>**
-(localhost only). On a remote server, tunnel it: `ssh -L 4747:127.0.0.1:4747 user@server`,
-then `weave serve --no-open` on the server and open the URL in your local browser.
+Run `weave serve` (or `/weave:serve` under the plugin) to open the graph in your browser
+at **<http://127.0.0.1:4747/>** (localhost only). On a remote server, tunnel it:
+`ssh -L 4747:127.0.0.1:4747 user@server`, then `weave serve --no-open` on the server and
+open the URL in your local browser.
+
+Click any **file node** in the workspace to read its content inline (size, abs path,
+copy-path button, and an "open in editor" link).
 
 <br>
 
@@ -71,6 +101,11 @@ Run inside a project directory, `weave init` scaffolds:
 - `.claude/commands/weave-*.md` — slash commands like `/weave-status`, `/weave-plan`.
 - `.gitignore` — gitignores `.mcp.json` + `settings.local.json` (they bake per-machine paths).
 
+If you installed weave via the plugin route, run `weave init --plugin` (or `/weave:init`)
+instead. That skips writing `.mcp.json`, `.claude/settings.local.json`, and
+`.claude/commands/` because the plugin already provides them globally — `weave init
+--plugin` only creates `.weave/` and the `CLAUDE.md` block.
+
 **Restart Claude Code afterward** — it reads `.mcp.json` and hooks at session start only.
 You should then see `[weave] shared project graph: .weave/graph.json …` at the top of the
 new session, and Claude will have the `weave_*` tools available.
@@ -84,8 +119,10 @@ change the graph. It is a dark, Apple-Finance-style workspace showing:
 
 - **Plans and their tasks** with status at a glance (todo / doing / done / blocked), and the current **focus** plan highlighted.
 - **Decisions, files, questions, notes, and milestones**, plus the edges that connect them (implements, depends_on, blocks, …).
-- **Search and filtering** across nodes, and a git-commit inspector (look up work by `HEAD`, a SHA, or a branch name).
+- **File preview** — click any file node to read it inline, with the abs path, copy-path button, and an "open in editor" link.
+- **Search and filtering** across nodes, plus a git-commit inspector (look up work by `HEAD`, a SHA, or a branch name).
 - **Adding nodes from the UI** — a short title plus a "detail for Claude" body.
+- **Undo + history** — every graph save snapshots the prior state; roll back from the menu when an edit went wrong.
 
 Change the port with `weave serve --port <n>`.
 
@@ -112,9 +149,6 @@ weave serve --no-open
 > Already connected? Add the forward without reconnecting: press `Enter`, then type `~C`
 > to get the `ssh>` prompt, and enter `-L 4747:127.0.0.1:4747`.
 
-> 📸 To show a preview in this README, run `weave serve`, take a screenshot, save it as
-> `docs/workspace.png`, and add `![weave workspace](docs/workspace.png)` to this section.
-
 ## Try it
 
 ```bash
@@ -124,7 +158,7 @@ weave serve    # opens the live workspace
 
 In Claude Code:
 
-- `/weave-status` — Claude summarizes the graph.
+- `/weave:status` (plugin) or `/weave-status` (standalone) — Claude summarizes the graph.
 - *"Add a plan for X and break it into 4 tasks"* — Claude adds the nodes via `weave_add`.
 - *"What should I read for the focus task?"* — Claude uses `weave_context`.
 
@@ -138,9 +172,21 @@ In Claude Code:
 
 ## Troubleshooting
 
-- **No `weave_*` MCP tools after init.** Restart Claude Code and **approve the prompt** to enable the weave MCP server — `.mcp.json` (and the approval prompt) is read at session start only.
+- **No `weave_*` MCP tools after init.** Restart Claude Code and **approve the prompt** to enable the weave MCP server — `.mcp.json` (and the approval prompt) is read at session start only. Plugin install? Run `/reload-plugins` or restart.
 - **`python3` not found** (Windows): install Python from <https://python.org> and tick *"Add Python to PATH"* during install. Some Windows setups need `python` rather than `python3`.
 - **`weave: command not found`** (macOS/Linux): make sure `~/bin` is on your `PATH`, or call it explicitly as `python3 ~/bin/weave …`.
 - **Full command reference:** `weave --help`. The weave block in your project's `CLAUDE.md` is the workflow reference Claude reads at session start.
 
-Ping Oskar with anything else. 🤝
+## Repo layout
+
+```
+weave                            # standalone single-file Python CLI (Option B users grab this)
+.claude-plugin/marketplace.json  # marketplace manifest (Option A entry point)
+plugins/weave/                   # the plugin
+  .claude-plugin/plugin.json
+  bin/weave                      # bundled copy of the script (Option A install consumes this)
+  hooks/hooks.json               # SessionStart / PreToolUse / PostToolUse
+  commands/*.md                  # /weave:* slash commands
+```
+
+Ping Oskar with anything else.
